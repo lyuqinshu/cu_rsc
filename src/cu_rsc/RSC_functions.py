@@ -1,4 +1,3 @@
-
 """
 GPU-accelerated Raman sideband cooling primitives using CuPy.
 
@@ -16,29 +15,107 @@ Pulse layout:
       - delta_n: int
       - time: float (in units of 1/Ω0)
 
-Requirements:
-    pip install cupy-cuda11x   # or appropriate CUDA wheel for your system
-
 Notes:
-    - This module keeps all heavy ops on the GPU via CuPy.
+    - All experiment parameters are loaded from config.json at import.
+    - Heavy ops stay on the GPU via CuPy.
     - Random draws use cupy.random; seed once via set_seed() for reproducibility.
     - M_FACTOR_TABLE is expected on host as a NumPy array with shape
-      (nmax, nmax, ld_bins). We upload it once with to_device_m_table().
-    - LD discretization: ld_index = round(|ld| / LD_RES), clamped to [0, ld_bins-1].
-    - Optical pumping uses a fixed maximum number of cycles K to avoid unbounded
-      loops and keep GPU-friendly control flow.
+      (nmax, nmax, ld_bins). Upload it once with to_device_m_table().
+    - LD discretization: ld_index = round(|eta| / LD_RES), clamped to [0, ld_bins-1].
+    - Optical pumping uses a fixed maximum number of cycles K to keep GPU-friendly control flow.
 """
 from __future__ import annotations
 
+import json
+from importlib.resources import files, as_file
+from pathlib import Path
+from typing import Tuple
+
 import cupy as cp
 import numpy as np
+import scipy.constants as cts
+
+# -------------------------
+# Load experiment config (CPU-side)
+# -------------------------
+
+_pkg = "cu_rsc"
+_rel = "data/M_FACTOR_TABLE.npy"
+
+with files(_pkg).joinpath("config.json").open("r") as _f:
+    _cfg = json.load(_f)
+
+# Physical constants & experiment parameters
+amu = 1.660_539_066_60e-27  # kg
+MASS = float(_cfg["mass"]) * amu
+TRAP_FREQ = np.array(_cfg["trap_freq"], dtype=float) * 2 * np.pi       # ω (rad/s), shape (3,)
+K_VEC = float(2 * np.pi / _cfg["lambda"])                               # |k| = 2π/λ
+DECAY_RATIO = tuple(map(float, _cfg["decay_ratio"]))                    # P(mN=-1,0,1)
+BRANCH_RATIO = float(_cfg["branch_ratio"])                              # spin branch prob
+TRAP_DEPTH_J = float(_cfg["trap_depth"]) * cts.k                        # J
+MAX_N = tuple(map(int, _cfg["max_n"]))                                  # per-axis basis cap
+LD_RES = float(_cfg["LD_RES"])                                          # η resolution (lookup)
+LD_RAMAN = tuple(map(float, _cfg["LD_raman"]))                          # η per axis for Raman
+ANGLE_PUMP_SIGMA = tuple(map(float, _cfg["angle_pump_sigma"]))          # (theta, phi)
+ANGLE_PUMP_PI    = tuple(map(float, _cfg["angle_pump_pi"]))             # (theta, phi)
+
+# n_limit from trap depth (consistent with CPU impl: int(trap_depth / (h * f)))
+def _n_limit_for_axis(omega_rad_s: float) -> int:
+    f_hz = omega_rad_s / (2 * np.pi)
+    return int(TRAP_DEPTH_J / (cts.h * f_hz))
+
+N_LIMIT = tuple(_n_limit_for_axis(w) for w in TRAP_FREQ)
+
+def setup_tables(force: bool = False) -> Path:
+    """
+    Ensure M_FACTOR_TABLE.npy exists under cu_rsc/data/. If force, recompute.
+    Returns the on-disk path.
+    """
+    from .generate_M import precompute_M_factors_gpu
+    with as_file(files(_pkg).joinpath(_rel)) as target:
+        target = Path(target)
+        if force or not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            precompute_M_factors_gpu(save_path=target)
+        return target
+
+def load_m_table_host(allow_compute: bool = False) -> np.ndarray:
+    """
+    Load cu_rsc/data/M_FACTOR_TABLE.npy from the installed package.
+    If missing and allow_compute=True, compute it on the GPU and save it there.
+    """
+    from .generate_M import precompute_M_factors_gpu  # lazy import to avoid heavy deps at import time
+
+    with as_file(files(_pkg).joinpath(_rel)) as target:
+        target = Path(target)
+        if target.exists():
+            return np.load(target, allow_pickle=False)
+
+        if not allow_compute:
+            raise FileNotFoundError(
+                f"M-factor table not found at {target}. "
+                f"Run `cu_rsc.setup_tables()` or call load_m_table_host(allow_compute=True)."
+            )
+
+        # Compute and save into the package data path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        M_host = precompute_M_factors_gpu(save_path=target)
+        return M_host
+
+
+def load_m_table_device(dtype=cp.float32, allow_compute: bool = False) -> cp.ndarray:
+    """
+    Load the M table from the package (host) and upload to device.
+    """
+    M_host = load_m_table_host(allow_compute=allow_compute)
+    return cp.asarray(M_host, dtype=dtype, order="C")
 
 # -------------------------
 # Seeding / utils
 # -------------------------
 
 def set_seed(seed: int | None) -> None:
-    """Seed CuPy RNG (and optionally NumPy for host-side prep)."""
+    """Seed CuPy RNG (and NumPy for any host prep)."""
     if seed is not None:
         cp.random.seed(int(seed))
         np.random.seed(int(seed ^ 0xA5A5_1234))
@@ -52,14 +129,15 @@ class GPUResources:
     def __init__(
         self,
         M_FACTOR_TABLE_dev: cp.ndarray,
-        LD_RES: float,
+        *,
+        ld_res: float,
         trap_freq: np.ndarray | cp.ndarray,  # rad/s, shape (3,)
         k_vec: float,
         max_n: tuple[int, int, int],
         n_limit: tuple[int, int, int],
     ) -> None:
         self.M = M_FACTOR_TABLE_dev
-        self.LD_RES = float(LD_RES)
+        self.LD_RES = float(ld_res)
         self.trap_freq = cp.asarray(trap_freq, dtype=cp.float64)
         self.k_vec = float(k_vec)
         self.max_n = tuple(int(x) for x in max_n)
@@ -68,6 +146,17 @@ class GPUResources:
     @property
     def ld_bins(self) -> int:
         return int(self.M.shape[2])
+
+def resources_from_config(M_dev: cp.ndarray) -> GPUResources:
+    """Convenience builder that wires GPUResources from the loaded config.json."""
+    return GPUResources(
+        M_FACTOR_TABLE_dev=M_dev,
+        ld_res=LD_RES,
+        trap_freq=TRAP_FREQ,
+        k_vec=K_VEC,
+        max_n=MAX_N,
+        n_limit=N_LIMIT,
+    )
 
 # -------------------------
 # Upload helpers
@@ -83,19 +172,15 @@ def to_device_m_table(M_FACTOR_TABLE_np: np.ndarray, dtype=cp.float32) -> cp.nda
 # LD & geometry (vectorized)
 # -------------------------
 
-def convert_to_LD(dK_axis: cp.ndarray, trap_f_axis: float) -> cp.ndarray:
-    """eta = |Δk| * x0 ; x0 = sqrt(hbar/(2 m ω)).  Here trap_f_axis is ω (rad/s).
-    NOTE: mass may be folded into Δk scaling externally if desired.
-    """
-    hbar = 1.054_571_817e-34
-    x0 = cp.sqrt(hbar / (2.0 * trap_f_axis))
-    return dK_axis * x0
+def convert_to_LD(dK_axis_abs: cp.ndarray, trap_w_axis: float) -> cp.ndarray:
+    """eta = |Δk| * x0 ; x0 = sqrt(hbar/(2 m ω)). trap_w_axis is ω (rad/s)."""
+    hbar = cts.hbar
+    x0 = cp.sqrt(hbar / (2.0 * MASS * float(trap_w_axis)))
+    return dK_axis_abs * x0
 
-
-def delta_k(k_vec: float, angle_pump: tuple[float, float], theta_s: cp.ndarray, phi_s: cp.ndarray) -> cp.ndarray:
-    """Return Δk vectors (N,3) for pump (theta,phi) against scattered (theta_s,phi_s).
-    k_vec is scalar 2π/λ.
-    """
+def delta_k(k_vec: float, angle_pump: Tuple[float, float],
+            theta_s: cp.ndarray, phi_s: cp.ndarray) -> cp.ndarray:
+    """Return Δk vectors (N,3) for pump (theta,phi) against scattered (theta_s,phi_s)."""
     theta_p, phi_p = angle_pump
     k_p = cp.asarray([
         cp.sin(theta_p) * cp.cos(phi_p),
@@ -118,26 +203,40 @@ def delta_k(k_vec: float, angle_pump: tuple[float, float], theta_s: cp.ndarray, 
 # -------------------------
 
 def rowwise_categorical_sample(prob: cp.ndarray) -> cp.ndarray:
-    """Sample one index per row from a row-normalized probability matrix.
-    prob: (N, K) nonnegative, not necessarily normalized.
-    Returns: idx (N,) int32
+    """Sample one index per row from a row-wise categorical distribution.
+
+    prob: (N, K) nonnegative (need not be normalized).
+    Returns: (N,) int32 indices.
     """
+    if prob.ndim != 2:
+        raise ValueError("prob must be 2D (N, K)")
+
+    N, K = prob.shape
+    if K == 0:
+        # No categories; return zeros to be safe (caller should ensure K>0)
+        return cp.zeros((N,), dtype=cp.int32)
+
+    # Normalize per row; handle all-zero rows safely
     sums = prob.sum(axis=1, keepdims=True)
     safe = cp.where(sums > 0, sums, 1.0)
     cdf = cp.cumsum(prob / safe, axis=1)
-    cdf[:, -1] = 1.0
-    u = cp.random.random((prob.shape[0],), dtype=prob.dtype)
-    idx = cp.searchsorted(cdf, u[:, None], side="left").astype(cp.int32).ravel()
+    cdf[:, -1] = 1.0  # ensure each row sums to 1 exactly
+
+    # Uniform draws, one per row
+    u = cp.random.random((N,), dtype=prob.dtype)
+
+    # For each row, idx = count of bins with cdf < u (i.e., first index where cdf >= u)
+    # Equivalent to searchsorted along axis=1, but works for 2D.
+    idx = (u[:, None] > cdf).sum(axis=1).astype(cp.int32)
     return idx
 
 # -------------------------
 # M lookups (vectorized gathers)
 # -------------------------
 
-def _ld_index_from_eta(eta_abs: cp.ndarray, LD_RES: float, ld_bins: int) -> cp.ndarray:
-    ld_idx = cp.rint(eta_abs / LD_RES).astype(cp.int32)
+def _ld_index_from_eta(eta_abs: cp.ndarray, ld_res: float, ld_bins: int) -> cp.ndarray:
+    ld_idx = cp.rint(eta_abs / ld_res).astype(cp.int32)
     return cp.minimum(ld_idx, ld_bins - 1)
-
 
 def m_lookup_rows(M: cp.ndarray, n_i: cp.ndarray, ld_idx: cp.ndarray, k_final: int) -> cp.ndarray:
     """Return a (N, k_final) matrix where rows m[i, nf] = M[n_i[i], nf, ld_idx[i]]."""
@@ -149,24 +248,25 @@ def m_lookup_rows(M: cp.ndarray, n_i: cp.ndarray, ld_idx: cp.ndarray, k_final: i
     return M[n_i_cols, nf_rows, ld_cols]
 
 # -------------------------
-# Public API
+# Public API (reads config.json values)
 # -------------------------
 
 def raman_apply(
     molecules_dev: cp.ndarray,
     pulses_dev: cp.ndarray,
-    LD_raman: tuple[float, float, float],
     res: GPUResources,
 ) -> None:
-    """Apply a full Raman pulse sequence on GPU (in-place mutate molecules_dev)."""
+    """Apply a full Raman pulse sequence on GPU (in-place), using LD_RAMAN from config."""
     if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 6:
         raise ValueError("molecules_dev must be (N,6)")
+    if pulses_dev.ndim != 2 or pulses_dev.shape[1] != 3:
+        raise ValueError("pulses_dev must be (P,3)")
 
     N = molecules_dev.shape[0]
     if N == 0:
         return
 
-    LD_raman = cp.asarray(LD_raman, dtype=cp.float64)
+    LD_raman_vec = cp.asarray(LD_RAMAN, dtype=cp.float64)
 
     for p in range(pulses_dev.shape[0]):
         axis   = int(pulses_dev[p, 0].item())
@@ -174,9 +274,9 @@ def raman_apply(
         t_puls = float(pulses_dev[p, 2].item())
 
         ok = (
-            (molecules_dev[:, 5] == 0) &
-            (molecules_dev[:, 3] == 1) &
-            (molecules_dev[:, 4] == 0)
+            (molecules_dev[:, 5] == 0) &   # not lost
+            (molecules_dev[:, 3] == 1) &   # state == +1
+            (molecules_dev[:, 4] == 0)     # spin == 0
         )
         if not bool(ok.any()):
             continue
@@ -187,7 +287,8 @@ def raman_apply(
         if not bool(valid.any()):
             continue
 
-        eta = cp.abs(LD_raman[axis])
+        # Discrete LD index from config LD_RAMAN
+        eta = cp.abs(LD_raman_vec[axis])
         ld_idx = _ld_index_from_eta(cp.full((N,), eta, dtype=cp.float64), res.LD_RES, res.ld_bins)
 
         sel = cp.where(valid)[0]
@@ -199,39 +300,43 @@ def raman_apply(
         success = valid & (u < prob)
 
         molecules_dev[success, axis] = n_f[success]
-        molecules_dev[success, 3] = -1
+        molecules_dev[success, 3] = -1  # moved to mN = -1 after Raman
         molecules_dev[:, axis] = cp.maximum(molecules_dev[:, axis], 0)
-
 
 def optical_pumping(
     molecules_dev: cp.ndarray,
     res: GPUResources,
-    angle_pump_sigma: tuple[float, float],
-    angle_pump_pi: tuple[float, float],
-    decay_ratio: tuple[float, float, float],
-    branch_ratio: float,
     K_max: int = 12,
 ) -> cp.ndarray:
-    """Vectorized optical pumping with fixed maximum cycles (GPU in-place)."""
     if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 6:
         raise ValueError("molecules_dev must be (N,6)")
 
     N = molecules_dev.shape[0]
     cycles_used = cp.zeros((N,), dtype=cp.int32)
-
     max_n = res.max_n
 
+    decay_probs = cp.asarray(DECAY_RATIO, dtype=cp.float32)
+    decay_probs = decay_probs / decay_probs.sum()
+    cdf_decay = cp.cumsum(decay_probs)
+
+    angle_sigma = ANGLE_PUMP_SIGMA
+    angle_pi    = ANGLE_PUMP_PI
+
     for k in range(int(K_max)):
-        active = (molecules_dev[:, 5] == 0) & (molecules_dev[:, 4] == 0) & (molecules_dev[:, 3] != 1)
+        # apply only to state -1 or 0, good spin, not lost
+        is_m_minus1_or_0 = (molecules_dev[:, 3] == -1) | (molecules_dev[:, 3] == 0)
+        active = (molecules_dev[:, 5] == 0) & (molecules_dev[:, 4] == 0) & is_m_minus1_or_0
         if not bool(active.any()):
             break
 
         use_sigma = active & (molecules_dev[:, 3] == -1)
+
+        # Random scattering angles
         theta_s = cp.pi * cp.random.random((N,), dtype=cp.float64)
         phi_s   = 2 * cp.pi * cp.random.random((N,), dtype=cp.float64)
 
-        dK_sigma = delta_k(res.k_vec, angle_pump_sigma, theta_s, phi_s)
-        dK_pi    = delta_k(res.k_vec, angle_pump_pi,    theta_s, phi_s)
+        dK_sigma = delta_k(res.k_vec, angle_sigma, theta_s, phi_s)
+        dK_pi    = delta_k(res.k_vec, angle_pi,    theta_s, phi_s)
         dK = cp.where(use_sigma[:, None], dK_sigma, dK_pi)
 
         for axis in range(3):
@@ -240,48 +345,40 @@ def optical_pumping(
             ld_idx = _ld_index_from_eta(eta, res.LD_RES, res.ld_bins)
 
             Kf = int(max_n[axis])
+            # Build probabilities but zero them for inactive rows
             Mrows = m_lookup_rows(res.M, cp.clip(n_i, 0, Kf - 1), ld_idx, Kf)
             prob = (Mrows ** 2).astype(cp.float32)
             prob = cp.where(active[:, None], prob, 0.0)
+
             nf_idx = rowwise_categorical_sample(prob)
-            molecules_dev[:, axis] = nf_idx
-            lost_axis = nf_idx >= res.n_limit[axis]
+            # WRITE BACK ONLY FOR ACTIVE ROWS
+            molecules_dev[active, axis] = nf_idx[active]
+
+            lost_axis = (nf_idx >= res.n_limit[axis]) & active
             molecules_dev[lost_axis, 5] = 1
 
-        probs = cp.asarray(decay_ratio, dtype=cp.float32)
-        probs = probs / probs.sum()
-        cdf = cp.cumsum(probs)
+        # decay to mN ∈ {-1,0,1} only for active rows
         u = cp.random.random((N,), dtype=cp.float32)
-        new_state = cp.where(u < cdf[0], -1, cp.where(u < cdf[1], 0, 1)).astype(cp.int32)
+        new_state = cp.where(u < cdf_decay[0], -1, cp.where(u < cdf_decay[1], 0, 1)).astype(cp.int32)
         molecules_dev[active, 3] = new_state[active]
 
+        # branching to other spin only for active rows
         u2 = cp.random.random((N,), dtype=cp.float32)
-        spun = active & (u2 < branch_ratio)
+        spun = active & (u2 < BRANCH_RATIO)
         molecules_dev[spun, 4] = 1
 
         cycles_used = cp.where(active, cycles_used + 1, cycles_used)
 
     return cycles_used
 
-# -------------------------
-# Combined: Raman + per-pulse optical pumping (GPU, no sync)
-# -------------------------
 
 def raman_cool_with_pumping(
     molecules_dev: cp.ndarray,
     pulses_dev: cp.ndarray,
-    LD_raman: tuple[float, float, float],
     res: GPUResources,
     *,
-    angle_pump_sigma: tuple[float, float],
-    angle_pump_pi: tuple[float, float],
-    decay_ratio: tuple[float, float, float],
-    branch_ratio: float,
     K_max: int = 12,
 ) -> None:
-    """Run a full Raman sequence where each pulse is followed by up to K_max
-    optical-pumping cycles. GPU-only, no explicit synchronizations.
-    """
     if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 6:
         raise ValueError("molecules_dev must be (N,6)")
     if pulses_dev.ndim != 2 or pulses_dev.shape[1] != 3:
@@ -291,11 +388,14 @@ def raman_cool_with_pumping(
     if N == 0:
         return
 
-    LD_raman = cp.asarray(LD_raman, dtype=cp.float64)
+    LD_raman_vec = cp.asarray(LD_RAMAN, dtype=cp.float64)
 
-    probs_decay = cp.asarray(decay_ratio, dtype=cp.float32)
-    probs_decay = probs_decay / probs_decay.sum()
-    cdf_decay = cp.cumsum(probs_decay)
+    decay_probs = cp.asarray(DECAY_RATIO, dtype=cp.float32)
+    decay_probs = decay_probs / decay_probs.sum()
+    cdf_decay = cp.cumsum(decay_probs)
+
+    angle_sigma = ANGLE_PUMP_SIGMA
+    angle_pi    = ANGLE_PUMP_PI
 
     for p in range(pulses_dev.shape[0]):
         # Raman
@@ -303,16 +403,12 @@ def raman_cool_with_pumping(
         d_n    = int(pulses_dev[p, 1].item())
         t_puls = float(pulses_dev[p, 2].item())
 
-        ok = (
-            (molecules_dev[:, 5] == 0) &
-            (molecules_dev[:, 3] == 1) &
-            (molecules_dev[:, 4] == 0)
-        )
+        ok = (molecules_dev[:, 5] == 0) & (molecules_dev[:, 3] == 1) & (molecules_dev[:, 4] == 0)
         n_i = molecules_dev[:, axis]
         n_f = n_i + d_n
         valid = ok & (n_f >= 0)
         if bool(valid.any()):
-            eta_axis = cp.abs(LD_raman[axis])
+            eta_axis = cp.abs(LD_raman_vec[axis])
             ld_idx = _ld_index_from_eta(cp.full((N,), eta_axis, dtype=cp.float64), res.LD_RES, res.ld_bins)
             sel = cp.where(valid)[0]
             m_vals = cp.zeros((N,), dtype=cp.float32)
@@ -324,18 +420,20 @@ def raman_cool_with_pumping(
             molecules_dev[success, 3] = -1
             molecules_dev[:, axis] = cp.maximum(molecules_dev[:, axis], 0)
 
-        # Pumping cycles
+        # OP cycles (only state -1 or 0)
         for k in range(int(K_max)):
-            active = (molecules_dev[:, 5] == 0) & (molecules_dev[:, 4] == 0) & (molecules_dev[:, 3] != 1)
+            is_m_minus1_or_0 = (molecules_dev[:, 3] == -1) | (molecules_dev[:, 3] == 0)
+            active = (molecules_dev[:, 5] == 0) & (molecules_dev[:, 4] == 0) & is_m_minus1_or_0
             if not bool(active.any()):
                 break
 
             use_sigma = active & (molecules_dev[:, 3] == -1)
+
             theta_s = cp.pi * cp.random.random((N,), dtype=cp.float64)
             phi_s   = 2 * cp.pi * cp.random.random((N,), dtype=cp.float64)
 
-            dK_sigma = delta_k(res.k_vec, angle_pump_sigma, theta_s, phi_s)
-            dK_pi    = delta_k(res.k_vec, angle_pump_pi,    theta_s, phi_s)
+            dK_sigma = delta_k(res.k_vec, angle_sigma, theta_s, phi_s)
+            dK_pi    = delta_k(res.k_vec, angle_pi,    theta_s, phi_s)
             dK = cp.where(use_sigma[:, None], dK_sigma, dK_pi)
 
             for ax in range(3):
@@ -346,17 +444,20 @@ def raman_cool_with_pumping(
                 Mrows = m_lookup_rows(res.M, cp.clip(n_i_ax, 0, Kf - 1), ld_idx, Kf)
                 prob = (Mrows ** 2).astype(cp.float32)
                 prob = cp.where(active[:, None], prob, 0.0)
+
                 nf_idx = rowwise_categorical_sample(prob)
-                molecules_dev[:, ax] = nf_idx
-                lost_axis = nf_idx >= res.n_limit[ax]
+                molecules_dev[active, ax] = nf_idx[active]
+
+                lost_axis = (nf_idx >= res.n_limit[ax]) & active
                 molecules_dev[lost_axis, 5] = 1
 
+            # decay & branching only for active
             u = cp.random.random((N,), dtype=cp.float32)
             new_state = cp.where(u < cdf_decay[0], -1, cp.where(u < cdf_decay[1], 0, 1)).astype(cp.int32)
             molecules_dev[active, 3] = new_state[active]
 
             u2 = cp.random.random((N,), dtype=cp.float32)
-            spun = active & (u2 < branch_ratio)
+            spun = active & (u2 < BRANCH_RATIO)
             molecules_dev[spun, 4] = 1
 
 
@@ -372,10 +473,10 @@ def make_device_molecules(mols_host_n_by_6: np.ndarray) -> cp.ndarray:
 def make_device_pulses(pulses_host: np.ndarray) -> cp.ndarray:
     if pulses_host.ndim != 2 or pulses_host.shape[1] != 3:
         raise ValueError("pulses must be (P,3)")
-    arr = np.asarray(pulses_host)
+    arr = np.asarray(pulses_host, dtype=float)
     arr[:, 0] = np.rint(arr[:, 0])
     arr[:, 1] = np.rint(arr[:, 1])
-    return cp.asarray(arr)
+    return cp.asarray(arr, dtype=cp.float64)
 
 def count_survivors(molecules_dev: cp.ndarray) -> int:
     return int((molecules_dev[:, 5] == 0).sum().get())

@@ -2,7 +2,8 @@ from .RSC_functions import (
     set_seed, to_device_m_table, GPUResources,
     make_device_molecules, make_device_pulses,
     raman_apply, optical_pumping, raman_cool_with_pumping,
-    count_survivors, ground_state_rate
+    count_survivors, ground_state_rate, load_m_table_device,
+    resources_from_config
 )
 from .build_molecules import (
     build_thermal_molecules_gpu,
@@ -10,6 +11,7 @@ from .build_molecules import (
 )
 
 from.analysis import *
+from.build_sequence import *
 
 # src/cu_rsc/__init__.py
 from importlib.resources import files, as_file
