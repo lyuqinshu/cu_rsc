@@ -4,3 +4,9 @@
 *.ptx
 *.cubin
 *.fatbin
+*.npy
+*.egg-info/
+.eggs/
+.ipynb_checkpoints/
+
+src/cu_rsc/data/M_FACTOR_TABLE.npy
