@@ -36,6 +36,7 @@ Example:
 ```python
 import cu_rsc as cr
 import cupy as cp
+cr.setup_tables()
 M_dev = cr.load_m_table_device()       
 res   = cr.resources_from_config(M_dev)
 ```

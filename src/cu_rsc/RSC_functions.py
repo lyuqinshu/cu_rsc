@@ -30,6 +30,7 @@ import json
 from importlib.resources import files, as_file
 from pathlib import Path
 from typing import Tuple
+from tqdm import tqdm
 
 import cupy as cp
 import numpy as np
@@ -378,7 +379,12 @@ def raman_cool_with_pumping(
     res: GPUResources,
     *,
     K_max: int = 12,
+    show_progress: bool = False,
 ) -> None:
+    """
+    GPU Raman + optical pumping simulation.
+    Added optional tqdm progress bar for pulse loop.
+    """
     if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 6:
         raise ValueError("molecules_dev must be (N,6)")
     if pulses_dev.ndim != 2 or pulses_dev.shape[1] != 3:
@@ -390,23 +396,29 @@ def raman_cool_with_pumping(
 
     LD_raman_vec = cp.asarray(LD_RAMAN, dtype=cp.float64)
 
+    # Precompute CDF for decays
     decay_probs = cp.asarray(DECAY_RATIO, dtype=cp.float32)
-    decay_probs = decay_probs / decay_probs.sum()
+    decay_probs /= decay_probs.sum()
     cdf_decay = cp.cumsum(decay_probs)
 
     angle_sigma = ANGLE_PUMP_SIGMA
-    angle_pi    = ANGLE_PUMP_PI
+    angle_pi = ANGLE_PUMP_PI
 
-    for p in range(pulses_dev.shape[0]):
-        # Raman
-        axis   = int(pulses_dev[p, 0].item())
-        d_n    = int(pulses_dev[p, 1].item())
+    # -------------------------------
+    # Main Raman pulse loop
+    # -------------------------------
+    pulse_iter = tqdm(range(pulses_dev.shape[0]), desc="Raman pulses", disable=not show_progress)
+
+    for p in pulse_iter:
+        axis = int(pulses_dev[p, 0].item())
+        d_n = int(pulses_dev[p, 1].item())
         t_puls = float(pulses_dev[p, 2].item())
 
         ok = (molecules_dev[:, 5] == 0) & (molecules_dev[:, 3] == 1) & (molecules_dev[:, 4] == 0)
         n_i = molecules_dev[:, axis]
         n_f = n_i + d_n
         valid = ok & (n_f >= 0)
+
         if bool(valid.any()):
             eta_axis = cp.abs(LD_raman_vec[axis])
             ld_idx = _ld_index_from_eta(cp.full((N,), eta_axis, dtype=cp.float64), res.LD_RES, res.ld_bins)
@@ -420,7 +432,9 @@ def raman_cool_with_pumping(
             molecules_dev[success, 3] = -1
             molecules_dev[:, axis] = cp.maximum(molecules_dev[:, axis], 0)
 
-        # OP cycles (only state -1 or 0)
+        # -------------------------------
+        # Optical pumping cycles
+        # -------------------------------
         for k in range(int(K_max)):
             is_m_minus1_or_0 = (molecules_dev[:, 3] == -1) | (molecules_dev[:, 3] == 0)
             active = (molecules_dev[:, 5] == 0) & (molecules_dev[:, 4] == 0) & is_m_minus1_or_0
@@ -430,10 +444,10 @@ def raman_cool_with_pumping(
             use_sigma = active & (molecules_dev[:, 3] == -1)
 
             theta_s = cp.pi * cp.random.random((N,), dtype=cp.float64)
-            phi_s   = 2 * cp.pi * cp.random.random((N,), dtype=cp.float64)
+            phi_s = 2 * cp.pi * cp.random.random((N,), dtype=cp.float64)
 
             dK_sigma = delta_k(res.k_vec, angle_sigma, theta_s, phi_s)
-            dK_pi    = delta_k(res.k_vec, angle_pi,    theta_s, phi_s)
+            dK_pi = delta_k(res.k_vec, angle_pi, theta_s, phi_s)
             dK = cp.where(use_sigma[:, None], dK_sigma, dK_pi)
 
             for ax in range(3):
@@ -451,7 +465,7 @@ def raman_cool_with_pumping(
                 lost_axis = (nf_idx >= res.n_limit[ax]) & active
                 molecules_dev[lost_axis, 5] = 1
 
-            # decay & branching only for active
+            # decay & branching (active only)
             u = cp.random.random((N,), dtype=cp.float32)
             new_state = cp.where(u < cdf_decay[0], -1, cp.where(u < cdf_decay[1], 0, 1)).astype(cp.int32)
             molecules_dev[active, 3] = new_state[active]
