@@ -25,7 +25,25 @@ Example:
   "LD_MAX": 3.0,
   "angle_pump_sigma": [1.57, 0.0], # [theta, phi] rad for σ-pump, referenced to the axial trap axis
   "angle_pump_pi":    [0.0, 0.0],  # [theta, phi] rad for π-pump, referenced to the axial trap axis
-  "LD_raman": [0.5, 0.5, 0.3]    # |Δk|x0 per axis used for Raman pulses
+  "LD_raman": [0.5, 0.5, 0.3],    # |Δk|x0 per axis used for Raman pulses
+
+  # Amplitude of the pulses in each axis, in format of "Axis" : [-1, -2, ...], Rabi frequency scaled linearly to amplitude
+  "amp_matrix": {
+    "0": [0.92],
+    "X": [0.3, 0.65, 0.65, 0.7, 0.7, 0.85],
+    "Y": [0.3, 0.65, 0.65, 0.7, 0.7, 0.85],
+    "Z": [0.14, 0.14, 0.14, 0.28, 0.28, 0.35, 0.35, 0.4, 0.4]
+  },
+
+  # Duration of the pulses in each axis, in format of "Axis" : [-1, -2, ...], in the unit of second
+  # The scaling is such that amp[-2]*duration[-2]*scale = pi/0.3
+  "duration_matrix": {
+    "OP": [8e-5],
+    "CO": [1e-4],
+    "X":  [5e-5, 7e-5, 7e-5, 9e-5, 9e-5, 11e-5],
+    "Y":  [5e-5, 7e-5, 7e-5, 9e-5, 9e-5, 11e-5],
+    "Z":  [2e-4, 2e-4, 2e-4, 5e-5, 5e-5, 7e-5, 7e-5, 9e-5, 9e-5]
+  }
 }
 ```
 

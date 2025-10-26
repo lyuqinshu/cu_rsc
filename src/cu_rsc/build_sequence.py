@@ -1,45 +1,117 @@
 from __future__ import annotations
 import numpy as np
 import cupy as cp
-from typing import Sequence, Tuple, Optional, Union
+from typing import Sequence, Tuple, Optional, Union, Dict, Any
 from pathlib import Path
+import json
 
 # ---------------------------
 # Experiment parameters
 # ---------------------------
 
-# Amplitudes (dimensionless) and raw durations (seconds)
-amp_matrix = {
-    "0": [0.92],
-    "X": [0.3, 0.65, 0.65, 0.7, 0.7, 0.85],
-    "Y": [0.3, 0.65, 0.65, 0.7, 0.7, 0.85],
-    "Z": [0.14, 0.14, 0.14, 0.28, 0.28, 0.35, 0.35, 0.4, 0.4],
-}
+_CFG_PATH = Path(__file__).with_name("config.json")
+# ---------------------------
+# Load experiment parameters from config.json
+# ---------------------------
 
-duration_matrix = {
-    "OP": [8e-5],
-    "CO": [1e-4],
-    "X": [5e-5, 7e-5, 7e-5, 9e-5, 9e-5, 11e-5],
-    "Y": [5e-5, 7e-5, 7e-5, 9e-5, 9e-5, 11e-5],
-    "Z": [2e-4, 2e-4, 2e-4, 5e-5, 5e-5, 7e-5, 7e-5, 9e-5, 9e-5],
-}
+_CFG_PATH = Path(__file__).with_name("config.json")
 
-_scaling_x = np.pi / 0.3 / (amp_matrix["X"][-2] * duration_matrix["X"][-2])
-_scaling_y = np.pi / 0.3 / (amp_matrix["Y"][-2] * duration_matrix["Y"][-2])
-_scaling_z = np.pi / 0.3 / (amp_matrix["Z"][-2] * duration_matrix["Z"][-2])
-_SCALINGS = (_scaling_x, _scaling_y, _scaling_z)
+def _as_float_list(x):
+    return [float(v) for v in x]
+
+def _validate_lists_equal_length(name: str, a: Sequence[float], b: Sequence[float]):
+    if len(a) != len(b):
+        raise ValueError(f"{name}: amplitude and duration lists must have the same length; got {len(a)} vs {len(b)}")
+
+def _compute_scalings_if_missing(amp: Dict[str, Sequence[float]],
+                                 dur: Dict[str, Sequence[float]]) -> Tuple[float, float, float]:
+    """
+    Compute per-axis scalings using: pi / 0.3 / (amp[axis][-2] * dur[axis][-2]).
+    Requires each axis to have at least 2 entries.
+    """
+    axes = ("X", "Y", "Z")
+    out = []
+    for ax in axes:
+        a = amp.get(ax)
+        d = dur.get(ax)
+        if a is None or d is None:
+            raise ValueError(f"Missing amp/duration list for axis '{ax}' in config.json")
+        if len(a) < 2 or len(d) < 2:
+            raise ValueError(f"Axis '{ax}' needs at least 2 entries to compute scaling; got {len(a)} amps, {len(d)} durs")
+        s = np.pi / 0.3 / (float(a[-2]) * float(d[-2]))
+        out.append(float(s))
+    return tuple(out)  # (sx, sy, sz)
+
+def _load_config(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"config.json not found at {path}")
+    with open(path, "r") as f:
+        cfg = json.load(f)
+
+    # Basic shape: amp_matrix, duration_matrix
+    amp_matrix_cfg = cfg.get("amp_matrix")
+    dur_matrix_cfg = cfg.get("duration_matrix")
+    if amp_matrix_cfg is None or dur_matrix_cfg is None:
+        raise ValueError("config.json must include 'amp_matrix' and 'duration_matrix'.")
+
+    # Normalize to lists of floats
+    amp_matrix = {
+        k: _as_float_list(v)
+        for k, v in amp_matrix_cfg.items()
+    }
+    duration_matrix = {
+        k: _as_float_list(v)
+        for k, v in dur_matrix_cfg.items()
+    }
+
+    # Ensure matching lengths per axis where relevant
+    for ax in ("X", "Y", "Z"):
+        if ax not in amp_matrix or ax not in duration_matrix:
+            raise ValueError(f"Axis '{ax}' missing in amp_matrix or duration_matrix.")
+        _validate_lists_equal_length(f"Axis '{ax}'", amp_matrix[ax], duration_matrix[ax])
+
+    # Load or compute scalings
+    scalings_cfg = cfg.get("scalings")
+    if scalings_cfg is None:
+        _SCALINGS = _compute_scalings_if_missing(amp_matrix, duration_matrix)
+    else:
+        # Accept dict {"X":..,"Y":..,"Z":..} or list/tuple [sx,sy,sz]
+        if isinstance(scalings_cfg, dict):
+            try:
+                _SCALINGS = (float(scalings_cfg["X"]),
+                             float(scalings_cfg["Y"]),
+                             float(scalings_cfg["Z"]))
+            except Exception as e:
+                raise ValueError("scalings must have keys 'X','Y','Z' with float values") from e
+        else:
+            if len(scalings_cfg) != 3:
+                raise ValueError("scalings must be length-3 when provided as a list/tuple")
+            _SCALINGS = tuple(float(v) for v in scalings_cfg)
+
+    # Non-axis keys like "OP","CO" can exist only in duration_matrix; that's fine.
+    return {
+        "amp_matrix": amp_matrix,
+        "duration_matrix": duration_matrix,
+        "SCALINGS": _SCALINGS,
+    }
+
+_CFG = _load_config(_CFG_PATH)
+
+# Expose normalized data
+amp_matrix: Dict[str, list[float]] = _CFG["amp_matrix"]
+duration_matrix: Dict[str, list[float]] = _CFG["duration_matrix"]
+_SCALINGS: Tuple[float, float, float] = _CFG["SCALINGS"]
 
 # Map axis->label
 _AXIS_KEY = {0: "X", 1: "Y", 2: "Z"}
 
-
 # ---------------------------
-# Core time helpers (CPU scalar math; returns float)
+# Core time helpers (unchanged API)
 # ---------------------------
 
 def pulse_time(axis: int, delta_n: int) -> float:
     """
-    Return the *base* pulse time for a given axis and Δn (no per-user scale matrix applied).
+    Return the base pulse time for a given axis and Δn (no per-user scale matrix applied).
     axis ∈ {0,1,2}, delta_n < 0 typical for cooling.
     """
     key = _AXIS_KEY[int(axis)]
@@ -48,7 +120,6 @@ def pulse_time(axis: int, delta_n: int) -> float:
         raise IndexError(f"delta_n={delta_n} out of range for axis {axis} ({key}).")
     base = _SCALINGS[axis] * amp_matrix[key][idx] * duration_matrix[key][idx]
     return float(base)
-
 
 def scaled_pulse_time(axis: int, delta_n: int, sm: Optional[np.ndarray]) -> float:
     """
