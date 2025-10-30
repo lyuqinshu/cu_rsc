@@ -229,3 +229,68 @@ def save_molecules(molecules, filename: str | Path) -> None:
     # Save as .npy
     np.save(filename, mols_host)
     print(f"[✓] Molecules saved to: {filename.resolve()}  (shape={mols_host.shape})")
+
+def visualize_sequence(seq, show_time_color: bool = False, title: str | None = None) -> None:
+    """
+    Visualize a Raman sideband cooling sequence from a sequence matrix.
+
+    Parameters
+    ----------
+    seq : np.ndarray or cp.ndarray
+        (P, 3) array representing the sequence: columns [axis, delta_n, time].
+    show_time_color : bool, optional
+        If True, color-code pulses by duration (time); otherwise by axis (default: False).
+    title : str, optional
+        Title for the plot.
+
+    Example
+    -------
+    >>> seq = np.load("top1_sequence.npy")
+    >>> visualize_sequence_matrix(seq)
+    >>> visualize_sequence_matrix(seq, show_time_color=True)
+    """
+    # Convert CuPy → NumPy if needed
+    if not isinstance(seq, np.ndarray):
+        try:
+            import cupy as cp
+            if isinstance(seq, cp.ndarray):
+                seq = cp.asnumpy(seq)
+            else:
+                raise TypeError("seq must be a NumPy or CuPy array.")
+        except ImportError:
+            raise TypeError("seq must be a NumPy array or CuPy array (CuPy not installed).")
+
+    if seq.ndim != 2 or seq.shape[1] != 3:
+        raise ValueError(f"Invalid sequence shape {seq.shape}, expected (P, 3).")
+
+    axes = seq[:, 0].astype(int)
+    delta_n = seq[:, 1].astype(int)
+    times = seq[:, 2].astype(float)
+    pulse_idx = np.arange(len(seq))
+
+    plt.figure(figsize=(10, 5))
+    if show_time_color:
+        sc = plt.scatter(pulse_idx, delta_n, c=times, cmap='plasma', s=40, alpha=0.9, edgecolor='k')
+        cbar = plt.colorbar(sc, label="Pulse duration (s)")
+    else:
+        # Distinct color per axis
+        colors = {0: "red", 1: "green", 2: "blue"}
+        labels = {0: "X", 1: "Y", 2: "Z"}
+        for ax in np.unique(axes):
+            mask = axes == ax
+            plt.scatter(pulse_idx[mask], delta_n[mask],
+                        label=f"Axis {labels.get(ax, ax)}",
+                        color=colors.get(ax, "gray"),
+                        s=40, alpha=0.9, edgecolor='k')
+
+    plt.xlabel("Pulse index")
+    plt.ylabel("Δn (vibrational quantum number change)")
+    plt.grid(True, linestyle='--', alpha=0.4)
+    if title is not None:
+        plt.title(title)
+    else:
+        plt.title("Raman Sideband Cooling Sequence")
+    if not show_time_color:
+        plt.legend()
+    plt.tight_layout()
+    plt.show()
