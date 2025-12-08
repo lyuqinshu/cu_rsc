@@ -12,6 +12,7 @@
   "angle_pump_sigma": [1.0, 0.0],
   "angle_pump_pi": [0.5, -0.25],
   "LD_raman": [0.57, 0.61, 0.62],
+  "rabi_freq": 25e3,
 
   
   "amp_matrix": {

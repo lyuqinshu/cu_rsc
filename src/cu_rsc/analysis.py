@@ -9,7 +9,6 @@ from pathlib import Path
 def get_n_distribution_gpu(
     mol_dev: cp.ndarray,
     plot: Sequence[bool] = (True, True, True),
-    scatter: bool = True,
     max_bins: int = 50,
 ):
     """
@@ -81,16 +80,6 @@ def get_n_distribution_gpu(
         axes[0].set_ylabel("Count")
         fig.suptitle(f"{mol_num} molecules survived")
         plt.tight_layout()
-        plt.show()
-
-    if scatter and mol_num > 0:
-        fig = plt.figure(figsize=(7, 6))
-        ax = fig.add_subplot(111, projection="3d")
-        ax.scatter(n_x, n_y, n_z, c="purple", alpha=0.7, edgecolor="k", s=10)
-        ax.set_xlabel("n_x")
-        ax.set_ylabel("n_y")
-        ax.set_zlabel("n_z")
-        ax.set_title(f"3D Scatter ({mol_num} molecules)")
         plt.show()
 
     return dict(counts_x), dict(counts_y), dict(counts_z)
