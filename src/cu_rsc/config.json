@@ -9,8 +9,8 @@
   "LD_RES": 0.01,
   "LD_MIN": 0.0,
   "LD_MAX": 2.5,
-  "angle_pump_sigma": [1.0, 0.0],
-  "angle_pump_pi": [0.5, -0.25],
+  "angle_pump_sigma": [0.0, 0.0],
+  "angle_pump_pi": [1.5707963267948966, -0.7853981633974483],
   "LD_raman": [0.57, 0.61, 0.62],
   "rabi_freq": 25e3,
 
