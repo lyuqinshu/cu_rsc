@@ -29,12 +29,12 @@ from __future__ import annotations
 import json
 from importlib.resources import files, as_file
 from pathlib import Path
-from typing import Tuple
 from tqdm import tqdm
 
 import cupy as cp
 import numpy as np
 import scipy.constants as cts
+from typing import Tuple, Sequence
 
 # -------------------------
 # Load experiment config (CPU-side)
@@ -355,6 +355,7 @@ def raman_cool_with_pumping(
     K_max: int = 12,
     show_progress: bool = False,
     Rabi_scale: float = 1.0,
+    Detuning: Sequence[float] = (0.0, 0.0, 0.0),  # per-axis detuning in linear Hz
 ) -> None:
     """
     GPU Raman + optical pumping simulation (no GPU sync inside).
@@ -363,7 +364,15 @@ def raman_cool_with_pumping(
         - Legacy (P,3):
             pulses[p] = [axis, delta_n, Omega_t]
             Omega_t = Omega_0 * t  (dimensionless pulse area)
-            -> ONLY resonant transition n -> n + delta_n (no off-resonant).
+            -> ONLY resonant transition n -> n + delta_n in the original model.
+
+            With detuning:
+                We interpret Omega_0 as the base angular Rabi frequency from config
+                (RABI_FREQ), so:
+                    t = Omega_t / RABI_FREQ
+                    Omega_eff = RABI_FREQ * Rabi_scale * M
+                and use:
+                    P = Rabi( Omega_eff, Δ_axis, t )
 
         - New (P,4):
             pulses[p] = [axis, delta_n, Omega_lin, t_sec]
@@ -372,12 +381,16 @@ def raman_cool_with_pumping(
 
             Internally:
                 Omega_ang = 2π * Omega_lin * Rabi_scale   (rad/s)
-                Delta     = TRAP_FREQ[axis]               (rad/s)
-            Includes nearest-neighbour off-res sidebands:
-                n -> n + delta_n     (Δ = 0)
-                n -> n + delta_n + 1 (Δ = ±ω_trap)
-                n -> n + delta_n - 1 (Δ = ±ω_trap)
+                Δ_axis    = 2π * Detuning[axis]           (rad/s)
 
+            Channels:
+                main: n -> n + delta_n, detuning Δ = Δ_axis
+                up:   n -> n + delta_n + 1, detuning Δ = Δ_axis + ω_trap
+                down: n -> n + delta_n - 1, detuning Δ = Δ_axis - ω_trap
+
+    Detuning:
+        Detuning = (delta_x, delta_y, delta_z) in linear Hz.
+        Detuning = (0,0,0) reproduces the old behavior (downwards compatible).
     """
     if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 6:
         raise ValueError("molecules_dev must be (N,6)")
@@ -400,6 +413,12 @@ def raman_cool_with_pumping(
 
     angle_sigma = ANGLE_PUMP_SIGMA
     angle_pi = ANGLE_PUMP_PI
+
+    # Per-axis detuning in angular frequency (rad/s)
+    detuning_ang = cp.asarray(
+        2.0 * np.pi * np.asarray(Detuning, dtype=float),
+        dtype=cp.float64,
+    )
 
     pulse_iter = tqdm(range(pulses.shape[0]), desc="Raman pulses", disable=not show_progress)
     n_cols = pulses.shape[1]
@@ -425,20 +444,37 @@ def raman_cool_with_pumping(
         eta_arr = cp.ones((N,), dtype=cp.float64) * eta_axis
         ld_idx = _ld_index_from_eta(eta_arr, res.LD_RES, res.ld_bins)
 
+        # Axis detuning (rad/s)
+        delta_axis_ang = detuning_ang[axis]
+
         # -----------------------------------
-        # Legacy (P,3) path – Omega_t = Omega_0 * t
+        # Legacy (P,3) path – Omega_t = Omega_0 * t, now with detuning
         # -----------------------------------
         if n_cols == 3:
-            Omega_t = float(pulses[p, 2])  # dimensionless
+            Omega_t = float(pulses[p, 2])  # dimensionless pulse area
 
             sel = cp.where(valid)[0]
             m_vals = cp.zeros((N,), dtype=cp.float32)
             if sel.size > 0:
                 m_vals[sel] = res.M[n_i[sel], n_f[sel], ld_idx[sel]]
 
-            # Classical probability: P = sin^2( (Rabi_scale * M * Omega_t)/2 )
-            prob = cp.sin(Rabi_scale * m_vals * (Omega_t * 0.5)) ** 2
-            prob = cp.where(valid, prob, 0.0)
+            # Base angular Rabi frequency from config (rad/s)
+            # RABI_FREQ is already in rad/s (loaded as 2π * rabi_freq[Hz])
+            Omega0 = cp.float64(RABI_FREQ * Rabi_scale)
+
+            # Interpret Omega_t = Omega0 * t  =>  t = Omega_t / RABI_FREQ
+            # (RABI_FREQ is the base angular frequency; Rabi_scale and M go into Ω_eff.)
+            t_sec = Omega_t / float(RABI_FREQ)
+            t_arr = cp.full((N,), t_sec, dtype=cp.float64)
+
+            # Effective Rabi frequency including M-factor and Rabi_scale
+            Omega_eff = Omega0 * m_vals.astype(cp.float64)
+
+            # Constant detuning for this axis
+            Delta_arr = cp.full((N,), float(delta_axis_ang), dtype=cp.float64)
+
+            prob = rabi_transition_prob(Omega_eff, Delta_arr, t_arr)
+            prob = cp.where(valid, prob.astype(cp.float32), 0.0)
 
             u = cp.random.random((N,), dtype=prob.dtype)
             success = valid & (u < prob)
@@ -457,38 +493,49 @@ def raman_cool_with_pumping(
             Omega_ang_base = (2.0 * np.pi) * Omega_lin * Rabi_scale  # rad/s
             t_arr = cp.full((N,), t_sec, dtype=cp.float64)
 
-            # --- Main transition: n -> n + d_n, Δ = 0 ---
+            # --- Main transition: n -> n + d_n, Δ = Δ_axis ---
             sel_main = cp.where(valid)[0]
             m_main = cp.zeros((N,), dtype=cp.float32)
             if sel_main.size > 0:
                 m_main[sel_main] = res.M[n_i[sel_main], n_f[sel_main], ld_idx[sel_main]]
+
             Omega_main = Omega_ang_base * m_main.astype(cp.float64)
-            Delta_main = cp.zeros_like(Omega_main)
+            Delta_main = cp.full((N,), float(delta_axis_ang), dtype=cp.float64)
             P_main = rabi_transition_prob(Omega_main, Delta_main, t_arr)
             P_main = cp.where(valid, P_main, 0.0)
 
-            # --- Off-res up: n -> n + d_n + 1 ---
+            # --- Off-res up: n -> n + d_n + 1, Δ = Δ_axis + ω_trap ---
             n_f_up = n_i + d_n + 1
             valid_up = ok & (n_f_up >= 0)
             sel_up = cp.where(valid_up)[0]
             m_up = cp.zeros((N,), dtype=cp.float32)
             if sel_up.size > 0:
                 m_up[sel_up] = res.M[n_i[sel_up], n_f_up[sel_up], ld_idx[sel_up]]
+
             Omega_up = Omega_ang_base * m_up.astype(cp.float64)
-            delta_axis = res.trap_freq[axis]  # CuPy scalar
-            Delta_up = cp.ones((N,), dtype=cp.float64) * delta_axis
+            trap_axis = res.trap_freq[axis]  # angular trap freq (rad/s)
+            Delta_up = cp.full(
+                (N,),
+                float(delta_axis_ang + trap_axis),
+                dtype=cp.float64,
+            )
             P_up = rabi_transition_prob(Omega_up, Delta_up, t_arr)
             P_up = cp.where(valid_up, P_up, 0.0)
 
-            # --- Off-res down: n -> n + d_n - 1 ---
+            # --- Off-res down: n -> n + d_n - 1, Δ = Δ_axis - ω_trap ---
             n_f_down = n_i + d_n - 1
             valid_down = ok & (n_f_down >= 0)
             sel_down = cp.where(valid_down)[0]
             m_down = cp.zeros((N,), dtype=cp.float32)
             if sel_down.size > 0:
                 m_down[sel_down] = res.M[n_i[sel_down], n_f_down[sel_down], ld_idx[sel_down]]
+
             Omega_down = Omega_ang_base * m_down.astype(cp.float64)
-            Delta_down = cp.ones((N,), dtype=cp.float64) * delta_axis
+            Delta_down = cp.full(
+                (N,),
+                float(delta_axis_ang - trap_axis),
+                dtype=cp.float64,
+            )
             P_down = rabi_transition_prob(Omega_down, Delta_down, t_arr)
             P_down = cp.where(valid_down, P_down, 0.0)
 
