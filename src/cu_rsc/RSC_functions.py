@@ -245,6 +245,17 @@ def _ld_index_from_eta(eta_abs: cp.ndarray, ld_res: float, ld_bins: int) -> cp.n
     ld_idx = cp.rint(eta_abs / ld_res).astype(cp.int32)
     return cp.minimum(ld_idx, ld_bins - 1)
 
+def ld_index_dithered(eta_abs: cp.ndarray, ld_res: float, ld_bins: int) -> cp.ndarray:
+    x = eta_abs / ld_res
+    i0 = cp.floor(x).astype(cp.int32)
+    i0 = cp.clip(i0, 0, ld_bins - 1)
+    i1 = cp.minimum(i0 + 1, ld_bins - 1)
+
+    w = (x - i0.astype(cp.float64)).astype(cp.float32)  # fractional part in [0,1)
+    u = cp.random.random(eta_abs.shape, dtype=cp.float32)
+    return cp.where(u < w, i1, i0).astype(cp.int32)
+
+
 def m_lookup_rows(M: cp.ndarray, n_i: cp.ndarray, ld_idx: cp.ndarray, k_final: int) -> cp.ndarray:
     """Return a (N, k_final) matrix where rows m[i, nf] = M[n_i[i], nf, ld_idx[i]]."""
     N = n_i.shape[0]
@@ -262,9 +273,13 @@ def optical_pumping(
     molecules_dev: cp.ndarray,
     res: GPUResources,
     K_max: int = 12,
+    delta_lim: int = None,
 ) -> cp.ndarray:
     if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 6:
         raise ValueError("molecules_dev must be (N,6)")
+
+    if delta_lim is not None and int(delta_lim) < 0:
+        raise ValueError("delta_lim must be None or a nonnegative int")
 
     N = molecules_dev.shape[0]
     cycles_used = cp.zeros((N,), dtype=cp.int32)
@@ -276,6 +291,11 @@ def optical_pumping(
 
     angle_sigma = ANGLE_PUMP_SIGMA
     angle_pi    = ANGLE_PUMP_PI
+
+    # Precompute nf grid once (used for windowing)
+    # Note: Kf differs by axis, so we build per-axis inside the loop.
+
+    dlim = None if delta_lim is None else int(delta_lim)
 
     for k in range(int(K_max)):
         # apply only to state -1 or 0, good spin, not lost
@@ -295,17 +315,31 @@ def optical_pumping(
         dK = cp.where(use_sigma[:, None], dK_sigma, dK_pi)
 
         for axis in range(3):
-            n_i = molecules_dev[:, axis]
+            n_i_raw = molecules_dev[:, axis].astype(cp.int32)
+
             eta = cp.abs(convert_to_LD(cp.abs(dK[:, axis]), res.trap_freq[axis]))
-            ld_idx = _ld_index_from_eta(eta, res.LD_RES, res.ld_bins)
+            ld_idx = ld_index_dithered(eta, res.LD_RES, res.ld_bins)
 
             Kf = int(max_n[axis])
-            # Build probabilities but zero them for inactive rows
-            Mrows = m_lookup_rows(res.M, cp.clip(n_i, 0, Kf - 1), ld_idx, Kf)
+            nf_grid = cp.arange(Kf, dtype=cp.int32)  # (Kf,)
+
+            # M lookup needs indices within [0, Kf-1]
+            n_i_clip = cp.clip(n_i_raw, 0, Kf - 1)
+
+            Mrows = m_lookup_rows(res.M, n_i_clip, ld_idx, Kf)  # (N, Kf)
             prob = (Mrows ** 2).astype(cp.float32)
+
+            # Optional: enforce |Δn| <= delta_lim
+            if dlim is not None:
+                # |nf - n_i_raw| <= dlim  (broadcast nf over rows)
+                dn_ok = (cp.abs(nf_grid[None, :] - n_i_raw[:, None]) <= dlim)
+                prob = cp.where(dn_ok, prob, 0.0)
+
+            # Zero for inactive rows
             prob = cp.where(active[:, None], prob, 0.0)
 
             nf_idx = rowwise_categorical_sample(prob)
+
             # WRITE BACK ONLY FOR ACTIVE ROWS
             molecules_dev[active, axis] = nf_idx[active]
 
@@ -314,7 +348,11 @@ def optical_pumping(
 
         # decay to mN ∈ {-1,0,1} only for active rows
         u = cp.random.random((N,), dtype=cp.float32)
-        new_state = cp.where(u < cdf_decay[0], -1, cp.where(u < cdf_decay[1], 0, 1)).astype(cp.int32)
+        new_state = cp.where(
+            u < cdf_decay[0],
+            -1,
+            cp.where(u < cdf_decay[1], 0, 1)
+        ).astype(cp.int32)
         molecules_dev[active, 3] = new_state[active]
 
         # branching to other spin only for active rows
@@ -325,6 +363,7 @@ def optical_pumping(
         cycles_used = cp.where(active, cycles_used + 1, cycles_used)
 
     return cycles_used
+
 
 def rabi_transition_prob(omega: cp.ndarray, delta: cp.ndarray, t: cp.ndarray) -> cp.ndarray:
     """
@@ -347,6 +386,143 @@ def rabi_transition_prob(omega: cp.ndarray, delta: cp.ndarray, t: cp.ndarray) ->
     return base * cp.sin(phase) ** 2
 
 
+def excecute_single_raman_pulse(
+    molecules_dev: cp.ndarray,
+    *,
+    axis: int,
+    d_n,                  # int OR CuPy scalar
+    Omega_lin: float,     # Hz (linear)
+    t_sec: float,         # seconds
+    res: GPUResources,
+    LD_raman_vec: cp.ndarray,
+    detuning_ang: cp.ndarray,  # (3,) rad/s (CuPy)
+    Rabi_scale: float,
+    k_max: int = 3,       # <-- NEW: include ±1 ... ±k_max
+) -> None:
+    """
+    Execute a single (P,4) Raman pulse on-GPU (no sync).
+
+    Channels:
+      main: n -> n + d_n
+      off-res: n -> n + d_n ± j,  j = 1 ... k_max
+      detuning: Δ = Δ_axis ± j*ω_trap
+    """
+    d_n_dev = cp.asarray(d_n, dtype=cp.int32)
+    N = molecules_dev.shape[0]
+
+    ok = (
+        (molecules_dev[:, 5] == 0) &
+        (molecules_dev[:, 3] == 1) &
+        (molecules_dev[:, 4] == 0)
+    )
+
+    n_i = molecules_dev[:, axis]
+
+    # LD index
+    eta_axis = cp.abs(LD_raman_vec[axis]).astype(cp.float64)
+    eta_arr = cp.full((N,), eta_axis, dtype=cp.float64)
+    ld_idx = _ld_index_from_eta(eta_arr, res.LD_RES, res.ld_bins)
+
+    delta_axis_ang = detuning_ang[axis].astype(cp.float64)
+
+    trap_axis = res.trap_freq[axis]
+    if not isinstance(trap_axis, cp.ndarray):
+        trap_axis = cp.asarray(trap_axis, dtype=cp.float64)
+    trap_axis = trap_axis.astype(cp.float64)
+
+    Omega_ang_base = (2.0 * np.pi) * float(Omega_lin) * float(Rabi_scale)
+    t_arr = cp.full((N,), float(t_sec), dtype=cp.float64)
+
+    nlim = int(res.n_limit[axis])
+    
+    def broadcast_detuning(det):
+        return cp.full((N,), 1.0, dtype=cp.float64) * det
+
+    # --------------------------------------------------
+    # Build transition channels
+    # Order:
+    #   0: main
+    #   1: +1, 2: -1, 3: +2, 4: -2, ..., 2*k_max
+    # --------------------------------------------------
+    P_list = []
+    valid_list = []
+    n_f_list = []
+
+    # --- main (j = 0) ---
+    n_f0 = n_i + d_n_dev
+    valid0 = ok & (n_f0 >= 0)
+    sel = cp.where(valid0)[0]
+
+    m0 = cp.zeros((N,), dtype=cp.float32)
+    if sel.size > 0:
+        m0[sel] = res.M[n_i[sel], n_f0[sel], ld_idx[sel]]
+
+    Omega0 = Omega_ang_base * m0.astype(cp.float64)
+    Delta0 = broadcast_detuning(delta_axis_ang)
+    P0 = rabi_transition_prob(Omega0, Delta0, t_arr)
+    P0 = cp.where(valid0, P0, 0.0)
+
+    P_list.append(P0.astype(cp.float32))
+    valid_list.append(valid0)
+    n_f_list.append(n_f0)
+
+    # --- off-resonant ±j ---
+    for j in range(1, k_max + 1):
+        for sign in (+1, -1):
+            j_dev = cp.asarray(sign * j, dtype=cp.int32)
+
+            n_fj = n_i + d_n_dev + j_dev
+            validj = ok & (n_fj >= 0)
+            sel = cp.where(validj)[0]
+
+            mj = cp.zeros((N,), dtype=cp.float32)
+            if sel.size > 0:
+                mj[sel] = res.M[n_i[sel], n_fj[sel], ld_idx[sel]]
+
+            Omegaj = Omega_ang_base * mj.astype(cp.float64)
+            Deltaj = broadcast_detuning(delta_axis_ang + trap_axis * j_dev.astype(cp.float64))
+            Pj = rabi_transition_prob(Omegaj, Deltaj, t_arr)
+            Pj = cp.where(validj, Pj, 0.0)
+
+            P_list.append(Pj.astype(cp.float32))
+            valid_list.append(validj)
+            n_f_list.append(n_fj)
+
+    # --------------------------------------------------
+    # Probabilistic selection
+    # --------------------------------------------------
+    total_trans = P_list[0]
+    for w in P_list[1:]:
+        total_trans = total_trans + w
+
+    w_none = cp.maximum(1.0 - total_trans, 0.0)
+
+    scale = cp.where(
+        total_trans > 1.0,
+        1.0 / cp.maximum(total_trans, 1e-12),
+        1.0,
+    ).astype(cp.float32)
+
+    w_none = cp.where(total_trans > 1.0, 0.0, w_none)
+    P_list = [w * scale for w in P_list]
+
+    weights = cp.stack([w_none] + P_list, axis=1)
+    choice = rowwise_categorical_sample(weights)
+
+    # --------------------------------------------------
+    # Apply transitions
+    # --------------------------------------------------
+    for idx, (validj, n_fj) in enumerate(zip(valid_list, n_f_list), start=1):
+        apply = validj & (choice == idx)
+        molecules_dev[apply, axis] = n_fj[apply]
+        molecules_dev[apply, 3] = -1
+        # Mark lost if motional number exceeds trap depth on this axis
+        lost_now = apply & (n_fj >= nlim)
+        molecules_dev[lost_now, 5] = 1
+
+    molecules_dev[:, axis] = cp.maximum(molecules_dev[:, axis], 0)
+
+
 def raman_cool_with_pumping(
     molecules_dev: cp.ndarray,
     pulses_dev,
@@ -356,6 +532,8 @@ def raman_cool_with_pumping(
     show_progress: bool = False,
     Rabi_scale: float = 1.0,
     Detuning: Sequence[float] = (0.0, 0.0, 0.0),  # per-axis detuning in linear Hz
+    k_max: int = 3,
+    delta_lim: int = None,
 ) -> None:
     """
     GPU Raman + optical pumping simulation (no GPU sync inside).
@@ -395,7 +573,6 @@ def raman_cool_with_pumping(
     if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 6:
         raise ValueError("molecules_dev must be (N,6)")
 
-    # Pulses live on host; if already NumPy, this is just a view/copy.
     pulses = np.asarray(pulses_dev, dtype=float)
     if pulses.ndim != 2 or pulses.shape[1] not in (3, 4):
         raise ValueError("pulses must be (P,3) or (P,4)")
@@ -405,14 +582,6 @@ def raman_cool_with_pumping(
         return
 
     LD_raman_vec = cp.asarray(LD_RAMAN, dtype=cp.float64)
-
-    # Optical pumping decay CDF
-    decay_probs = cp.asarray(DECAY_RATIO, dtype=cp.float32)
-    decay_probs /= decay_probs.sum()
-    cdf_decay = cp.cumsum(decay_probs)
-
-    angle_sigma = ANGLE_PUMP_SIGMA
-    angle_pi = ANGLE_PUMP_PI
 
     # Per-axis detuning in angular frequency (rad/s)
     detuning_ang = cp.asarray(
@@ -428,29 +597,29 @@ def raman_cool_with_pumping(
         d_n = int(pulses[p, 1])
 
         # -----------------------------------
-        # Common masks for Raman
-        # -----------------------------------
-        ok = (
-            (molecules_dev[:, 5] == 0) &   # not lost
-            (molecules_dev[:, 3] == 1) &   # state == +1
-            (molecules_dev[:, 4] == 0)     # spin == 0
-        )
-        n_i = molecules_dev[:, axis]
-        n_f = n_i + d_n
-        valid = ok & (n_f >= 0)
-
-        # LD index for this axis (constant per pulse)
-        eta_axis = cp.abs(LD_raman_vec[axis])      # CuPy scalar
-        eta_arr = cp.ones((N,), dtype=cp.float64) * eta_axis
-        ld_idx = _ld_index_from_eta(eta_arr, res.LD_RES, res.ld_bins)
-
-        # Axis detuning (rad/s)
-        delta_axis_ang = detuning_ang[axis]
-
-        # -----------------------------------
-        # Legacy (P,3) path – Omega_t = Omega_0 * t, now with detuning
+        # Legacy (P,3) behavior unchanged
         # -----------------------------------
         if n_cols == 3:
+            # -----------------------------------
+            # Common masks for Raman
+            # -----------------------------------
+            ok = (
+                (molecules_dev[:, 5] == 0) &   # not lost
+                (molecules_dev[:, 3] == 1) &   # state == +1
+                (molecules_dev[:, 4] == 0)     # spin == 0
+            )
+            n_i = molecules_dev[:, axis]
+            n_f = n_i + d_n
+            valid = ok & (n_f >= 0)
+
+            # LD index for this axis (constant per pulse)
+            eta_axis = cp.abs(LD_raman_vec[axis])      # CuPy scalar
+            eta_arr = cp.ones((N,), dtype=cp.float64) * eta_axis
+            ld_idx = _ld_index_from_eta(eta_arr, res.LD_RES, res.ld_bins)
+
+            # Axis detuning (rad/s)
+            delta_axis_ang = detuning_ang[axis]
+
             Omega_t = float(pulses[p, 2])  # dimensionless pulse area
 
             sel = cp.where(valid)[0]
@@ -463,7 +632,6 @@ def raman_cool_with_pumping(
             Omega0 = cp.float64(RABI_FREQ * Rabi_scale)
 
             # Interpret Omega_t = Omega0 * t  =>  t = Omega_t / RABI_FREQ
-            # (RABI_FREQ is the base angular frequency; Rabi_scale and M go into Ω_eff.)
             t_sec = Omega_t / float(RABI_FREQ)
             t_arr = cp.full((N,), t_sec, dtype=cp.float64)
 
@@ -484,143 +652,124 @@ def raman_cool_with_pumping(
             molecules_dev[:, axis] = cp.maximum(molecules_dev[:, axis], 0)
 
         # -----------------------------------
-        # New (P,4) path – explicit Omega_lin (Hz), t (s), with off-resonant channels
+        # New (P,4) behavior moved into excecute_single_raman_pulse (no sync)
         # -----------------------------------
         else:
             Omega_lin = float(pulses[p, 2])  # Hz
             t_sec = float(pulses[p, 3])      # s
 
-            Omega_ang_base = (2.0 * np.pi) * Omega_lin * Rabi_scale  # rad/s
-            t_arr = cp.full((N,), t_sec, dtype=cp.float64)
-
-            # --- Main transition: n -> n + d_n, Δ = Δ_axis ---
-            sel_main = cp.where(valid)[0]
-            m_main = cp.zeros((N,), dtype=cp.float32)
-            if sel_main.size > 0:
-                m_main[sel_main] = res.M[n_i[sel_main], n_f[sel_main], ld_idx[sel_main]]
-
-            Omega_main = Omega_ang_base * m_main.astype(cp.float64)
-            Delta_main = cp.full((N,), float(delta_axis_ang), dtype=cp.float64)
-            P_main = rabi_transition_prob(Omega_main, Delta_main, t_arr)
-            P_main = cp.where(valid, P_main, 0.0)
-
-            # --- Off-res up: n -> n + d_n + 1, Δ = Δ_axis + ω_trap ---
-            n_f_up = n_i + d_n + 1
-            valid_up = ok & (n_f_up >= 0)
-            sel_up = cp.where(valid_up)[0]
-            m_up = cp.zeros((N,), dtype=cp.float32)
-            if sel_up.size > 0:
-                m_up[sel_up] = res.M[n_i[sel_up], n_f_up[sel_up], ld_idx[sel_up]]
-
-            Omega_up = Omega_ang_base * m_up.astype(cp.float64)
-            trap_axis = res.trap_freq[axis]  # angular trap freq (rad/s)
-            Delta_up = cp.full(
-                (N,),
-                float(delta_axis_ang + trap_axis),
-                dtype=cp.float64,
+            excecute_single_raman_pulse(
+                molecules_dev,
+                axis=axis,
+                d_n=d_n,
+                Omega_lin=Omega_lin,
+                t_sec=t_sec,
+                res=res,
+                LD_raman_vec=LD_raman_vec,
+                detuning_ang=detuning_ang,
+                Rabi_scale=Rabi_scale,
+                k_max=k_max,
             )
-            P_up = rabi_transition_prob(Omega_up, Delta_up, t_arr)
-            P_up = cp.where(valid_up, P_up, 0.0)
 
-            # --- Off-res down: n -> n + d_n - 1, Δ = Δ_axis - ω_trap ---
-            n_f_down = n_i + d_n - 1
-            valid_down = ok & (n_f_down >= 0)
-            sel_down = cp.where(valid_down)[0]
-            m_down = cp.zeros((N,), dtype=cp.float32)
-            if sel_down.size > 0:
-                m_down[sel_down] = res.M[n_i[sel_down], n_f_down[sel_down], ld_idx[sel_down]]
+        optical_pumping(
+            molecules_dev=molecules_dev,
+            res=res,
+            K_max=K_max,
+            delta_lim=delta_lim,
+        )
 
-            Omega_down = Omega_ang_base * m_down.astype(cp.float64)
-            Delta_down = cp.full(
-                (N,),
-                float(delta_axis_ang - trap_axis),
-                dtype=cp.float64,
-            )
-            P_down = rabi_transition_prob(Omega_down, Delta_down, t_arr)
-            P_down = cp.where(valid_down, P_down, 0.0)
 
-            # --- Model 1: use Rabi probabilities as real probabilities ---
+def raman_sideband_thermometry(
+    molecules_dev: cp.ndarray,
+    axis: int,
+    frequencys: cp.ndarray,
+    rabi_freq: float,
+    pulse_time: float,
+    res: GPUResources,
+    show_progress: bool = True,
+    k_max: int = 3,
+) -> Tuple[cp.ndarray, cp.ndarray]:
+    """
+    Simulate Raman sideband thermometry without GPU synchronization.
+    Parameters:
+        molecules_dev: (N,6) array of molecules on device
+        axis: 0, 1, or 2 for the trap axis to probe
+        frequencys: (F,) array of Raman probe frequencies (linear Hz) on device
+        rabi_freq: Rabi frequency (linear Hz) of the Raman probe
+        pulse_time: pulse duration (seconds)
+        res: GPUResources container
+        show_progress: whether to show a progress bar
+        k_max: maximum off-resonant sideband order to include
+    """
+    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 6:
+        raise ValueError("molecules_dev must be (N,6)")
+    if axis not in (0, 1, 2):
+        raise ValueError("axis must be 0, 1, or 2")
+    if frequencys.ndim != 1:
+        raise ValueError("frequencys must be a 1D array")
 
-            w_main = P_main.astype(cp.float32)
-            w_up   = P_up.astype(cp.float32)
-            w_down = P_down.astype(cp.float32)
+    polarizations = cp.zeros(frequencys.shape, dtype=cp.float64)
 
-            total_trans = w_main + w_up + w_down
+    # Precompute constants/buffers (device-side)
+    LD_raman_vec = cp.asarray(LD_RAMAN, dtype=cp.float64)
 
-            # Base "none" probability when total_trans <= 1
-            w_none = 1.0 - total_trans
-            w_none = cp.maximum(w_none, 0.0)
+    # Trap freq on device (rad/s) -> linear Hz on device
+    trap_axis = res.trap_freq[axis]
+    if not isinstance(trap_axis, cp.ndarray):
+        trap_axis = cp.asarray(trap_axis, dtype=cp.float64)
+    trap_axis = trap_axis.astype(cp.float64)
+    trap_hz = trap_axis / (2.0 * np.pi)  # device scalar
 
-            # For rows where total_trans > 1, renormalize transitions to sum to 1, none=0
-            scale = cp.where(
-                total_trans > 1.0,
-                1.0 / cp.maximum(total_trans, 1e-12),
-                1.0
-            )
-            w_main *= scale
-            w_up   *= scale
-            w_down *= scale
-            w_none = cp.where(total_trans > 1.0, 0.0, w_none)
+    # Define the population we normalize over ONCE (device-side, constant across scan)
+    # Include those starting in mN = +1 or -1, but only if not lost and correct spin.
+    surv0 = (molecules_dev[:, 5] == 0) & (molecules_dev[:, 4] == 0)
+    start_addr = surv0 & ((molecules_dev[:, 3] == 1) | (molecules_dev[:, 3] == -1))
 
-            weights = cp.stack([w_none, w_main, w_up, w_down], axis=1)
-            choice = rowwise_categorical_sample(weights)
+    denom = start_addr.sum(dtype=cp.int32)         # device scalar
+    denom_f = denom.astype(cp.float64)             # device scalar float
 
-            apply_main = valid & (choice == 1)
-            apply_up   = valid_up & (choice == 2)
-            apply_down = valid_down & (choice == 3)
+    # Work buffer so each frequency uses the same initial ensemble (no host sync)
+    work = molecules_dev.copy()
 
-            molecules_dev[apply_main, axis] = n_f[apply_main]
-            molecules_dev[apply_main, 3] = -1
+    for i in tqdm(range(int(frequencys.size)), desc="Raman thermometry", disable=not show_progress):
+        cp.copyto(work, molecules_dev)  # device->device reset, no sync
 
-            molecules_dev[apply_up, axis] = n_f_up[apply_up]
-            molecules_dev[apply_up, 3] = -1
+        freq = frequencys[i].astype(cp.float64)
 
-            molecules_dev[apply_down, axis] = n_f_down[apply_down]
-            molecules_dev[apply_down, 3] = -1
+        # Choose nearest sideband order (device scalar)
+        d_n = cp.rint(freq / trap_hz).astype(cp.int32)
 
-            molecules_dev[:, axis] = cp.maximum(molecules_dev[:, axis], 0)
+        # Residual detuning to nearest transition (linear Hz -> angular rad/s), on device
+        detuning_ang = cp.zeros((3,), dtype=cp.float64)
+        detuning_ang[axis] = (2.0 * np.pi) * (freq - d_n.astype(cp.float64) * trap_hz)
 
-        # -----------------------------------
-        # Optical pumping cycles (no sync)
-        # -----------------------------------
-        for k in range(int(K_max)):
-            is_m_minus1_or_0 = (molecules_dev[:, 3] == -1) | (molecules_dev[:, 3] == 0)
-            active = (molecules_dev[:, 5] == 0) & (molecules_dev[:, 4] == 0) & is_m_minus1_or_0
+        excecute_single_raman_pulse(
+            molecules_dev=work,
+            axis=axis,
+            d_n=d_n,                 # device scalar
+            Omega_lin=rabi_freq,     # host float OK
+            t_sec=pulse_time,        # host float OK
+            res=res,
+            LD_raman_vec=LD_raman_vec,
+            detuning_ang=detuning_ang,
+            Rabi_scale=1.0,
+            k_max=k_max,
+        )
 
-            theta_s = cp.pi * cp.random.random((N,), dtype=cp.float64)
-            phi_s = 2 * cp.pi * cp.random.random((N,), dtype=cp.float64)
+        # Count mN == -1 AFTER the pulse, restricted to the initial addressable subset
+        numer = (start_addr & (work[:, 3] == -1)).sum(dtype=cp.int32)  # device scalar
+        numer_f = numer.astype(cp.float64)
 
-            use_sigma = active & (molecules_dev[:, 3] == -1)
-            dK_sigma = delta_k(res.k_vec, angle_sigma, theta_s, phi_s)
-            dK_pi = delta_k(res.k_vec, angle_pi, theta_s, phi_s)
-            dK = cp.where(use_sigma[:, None], dK_sigma, dK_pi)
+        # Polarization on device; define behavior if denom==0 without syncing
+        polarizations[i] = cp.where(
+            denom > 0,
+            # (2.0 * numer_f / denom_f) - 1.0,
+            numer_f,
+            cp.nan,   # or -1.0 if you prefer
+        )
 
-            for ax in range(3):
-                n_i_ax = molecules_dev[:, ax]
-                eta = cp.abs(convert_to_LD(cp.abs(dK[:, ax]), res.trap_freq[ax]))
-                ld_idx_k = _ld_index_from_eta(eta, res.LD_RES, res.ld_bins)
-                Kf = int(res.max_n[ax])
-                Mrows = m_lookup_rows(res.M, cp.clip(n_i_ax, 0, Kf - 1), ld_idx_k, Kf)
-                prob = (Mrows ** 2).astype(cp.float32)
-                prob = cp.where(active[:, None], prob, 0.0)
+    return frequencys, polarizations
 
-                nf_idx = rowwise_categorical_sample(prob)
-                molecules_dev[active, ax] = nf_idx[active]
-
-                lost_axis = (nf_idx >= res.n_limit[ax]) & active
-                molecules_dev[lost_axis, 5] = 1
-
-            u = cp.random.random((N,), dtype=cp.float32)
-            new_state = cp.where(
-                u < cdf_decay[0],
-                -1,
-                cp.where(u < cdf_decay[1], 0, 1)
-            ).astype(cp.int32)
-            molecules_dev[active, 3] = new_state[active]
-
-            u2 = cp.random.random((N,), dtype=cp.float32)
-            spun = active & (u2 < BRANCH_RATIO)
-            molecules_dev[spun, 4] = 1
 
 
 # -------------------------

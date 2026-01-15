@@ -3,7 +3,7 @@ from .RSC_functions import (
     make_device_molecules, make_device_pulses,
     optical_pumping, raman_cool_with_pumping,
     count_survivors, ground_state_rate, load_m_table_device,
-    resources_from_config
+    resources_from_config, raman_sideband_thermometry,
 )
 from .build_molecules import (
     build_thermal_molecules_gpu,

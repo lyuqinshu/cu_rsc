@@ -9,13 +9,8 @@ from importlib.resources import files, as_file
 from pathlib import Path
 from tqdm import tqdm
 
-# Prefer CuPy's special functions; hyp1f1 may be unavailable on older CuPy
-try:
-    from cupyx.scipy.special import gammaln, hyp1f1  # confluent hypergeometric
-    _HAS_HYP1F1 = True
-except Exception:
-    from cupyx.scipy.special import gammaln
-    _HAS_HYP1F1 = False
+# Do not use hyp1f1, it is unstable for large broadcasted inputs
+from cupyx.scipy.special import gammaln
 
 # -----------------------------
 # Config & constants (host)
@@ -43,62 +38,36 @@ LD_LEN = int(LD_GRID.size)
 MAX_N = int(max(max_n))
 N_STATES = MAX_N + 1
 
-# -----------------------------
-# Generalized Laguerre via hyp1f1 or series
-# -----------------------------
-def _genlaguerre_hyp1f1(n: cp.ndarray, alpha: cp.ndarray, x: cp.ndarray) -> cp.ndarray:
-    """Compute L_n^{(alpha)}(x) using confluent hypergeometric: 
-       L_n^{(α)}(x) = Γ(n+α+1)/(Γ(α+1) Γ(n+1)) * 1F1(-n, α+1, x).
-       Supports broadcasting over n, alpha, x.
-    """
-    b = alpha + 1.0
-    # prefactor = gamma(n+alpha+1)/(gamma(alpha+1)*gamma(n+1))
-    pref = cp.exp(gammaln(n + b) - gammaln(b) - gammaln(n + 1.0))
-    return pref * hyp1f1(-n, b, x)
 
-def _genlaguerre_series(n: cp.ndarray, alpha: cp.ndarray, x: cp.ndarray, k_max: int | None = None) -> cp.ndarray:
-    """Fallback when hyp1f1 is unavailable. Truncated series since a = -n."""
-    # Ensure arrays
-    n = cp.asarray(n, dtype=cp.float64)
+
+def _genlaguerre_recurrence(n: cp.ndarray, alpha: cp.ndarray, x: cp.ndarray) -> cp.ndarray:
+    # n, alpha, x broadcastable to same shape
+    n = cp.asarray(n, dtype=cp.int32)
     alpha = cp.asarray(alpha, dtype=cp.float64)
-    x = cp.asarray(x, dtype=cp.float64)  # broadcastable (may be scalar)
+    x = cp.asarray(x, dtype=cp.float64)
 
-    b = alpha + 1.0
-    if k_max is None:
-        k_max = int(cp.max(n).get())
+    # L0 and L1
+    L0 = cp.ones_like(x, dtype=cp.float64)
+    L1 = 1.0 + alpha - x
 
-    # Important: shape like n, not x
-    out = cp.zeros_like(n, dtype=cp.float64)
+    # Handle n=0/1 quickly
+    out = cp.where(n == 0, L0, cp.where(n == 1, L1, 0.0))
 
-    ks = cp.arange(k_max + 1, dtype=cp.float64)
-    fact = cp.concatenate([cp.asarray([1.0]), cp.cumprod(ks[1:])])
+    # Recurrence up to max(n)
+    Lkm1 = L0
+    Lk = L1
 
-    gln_n1 = gammaln(n + 1.0)   # Γ(n+1)
-    gln_b  = gammaln(b)         # Γ(b)
+    for k in range(1, MAX_N):
+        # compute L_{k+1}
+        kf = float(k)
+        Lkp1 = ((2.0*kf + 1.0 + alpha - x) * Lk - (kf + alpha) * Lkm1) / (kf + 1.0)
 
-    for k in range(k_max + 1):
-        term_mask = (n >= k)
-        if not bool(term_mask.any()):
-            continue
+        out = cp.where(n == (k+1), Lkp1, out)
 
-        sign = -1.0 if (k % 2 == 1) else 1.0
-        num = cp.exp(gln_n1 - gammaln(n - k + 1.0))          # n!/(n-k)!
-        poch_neg_n = sign * num
-        poch_b = cp.exp(gammaln(b + k) - gln_b)              # (b)_k
-        coeff = (poch_neg_n / poch_b) / fact[k]
-        xk = x**k                                            # broadcasts if scalar
-        term = cp.where(term_mask, coeff * xk, 0.0)
-        out = out + term
+        Lkm1, Lk = Lk, Lkp1
 
-    pref = cp.exp(gammaln(n + b) - gln_b - gln_n1)           # Γ(n+α+1)/(Γ(α+1)Γ(n+1))
-    return pref * out
+    return out
 
-
-def _eval_genlaguerre(n, alpha, x):
-    if _HAS_HYP1F1:
-        return _genlaguerre_hyp1f1(n, alpha, x)
-    else:
-        return _genlaguerre_series(n, alpha, x)
 
 
 
@@ -123,7 +92,7 @@ def _M_factor_matrix(n_i_mat: cp.ndarray, n_f_mat: cp.ndarray, eta: float) -> cp
 
     # Key change: broadcast x to the shape of n_small to avoid scalar-related issues
     x_arr = cp.full_like(n_small, eta2, dtype=cp.float64)
-    L = _eval_genlaguerre(n_small.astype(cp.float64), delta.astype(cp.float64), x_arr)
+    L = _genlaguerre_recurrence(n_small.astype(cp.int32), delta.astype(cp.float64), x_arr)
 
     return cp.exp(-0.5 * eta2 + pref) * L
 
@@ -142,6 +111,9 @@ def precompute_M_factors_gpu(dtype: str = "float32", save_path: Path | None = No
     for ld_idx in tqdm(range(LD_LEN), desc="Precomputing M-factor (GPU)"):
         eta = float(LD_GRID[ld_idx].item())
         M_slice = _M_factor_matrix(n_i_mat, n_f_mat, eta)
+        if cp.isnan(M_slice).any():
+            raise FloatingPointError(f"NaNs at eta={eta} ld_idx={ld_idx}")
+
         M_dev[:, :, ld_idx] = M_slice.astype(out_dtype, copy=False)
 
     M_host = cp.asnumpy(M_dev)
