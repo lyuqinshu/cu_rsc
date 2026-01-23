@@ -307,8 +307,11 @@ def optical_pumping(
         use_sigma = active & (molecules_dev[:, 3] == -1)
 
         # Random scattering angles
-        theta_s = cp.pi * cp.random.random((N,), dtype=cp.float64)
-        phi_s   = 2 * cp.pi * cp.random.random((N,), dtype=cp.float64)
+        u = cp.random.random((N,), dtype=cp.float64)
+        cos_theta = 1.0 - 2.0*u          # uniform in [-1,1]
+        theta_s = cp.arccos(cos_theta)
+        phi_s   = 2*cp.pi*cp.random.random((N,), dtype=cp.float64)
+
 
         dK_sigma = delta_k(res.k_vec, angle_sigma, theta_s, phi_s)
         dK_pi    = delta_k(res.k_vec, angle_pi,    theta_s, phi_s)
@@ -318,6 +321,89 @@ def optical_pumping(
             n_i_raw = molecules_dev[:, axis].astype(cp.int32)
 
             eta = cp.abs(convert_to_LD(cp.abs(dK[:, axis]), res.trap_freq[axis]))
+            ld_idx = ld_index_dithered(eta, res.LD_RES, res.ld_bins)
+
+            Kf = int(max_n[axis])
+            nf_grid = cp.arange(Kf, dtype=cp.int32)  # (Kf,)
+
+            # M lookup needs indices within [0, Kf-1]
+            n_i_clip = cp.clip(n_i_raw, 0, Kf - 1)
+
+            Mrows = m_lookup_rows(res.M, n_i_clip, ld_idx, Kf)  # (N, Kf)
+            prob = (Mrows ** 2).astype(cp.float32)
+
+            # Optional: enforce |Δn| <= delta_lim
+            if dlim is not None:
+                # |nf - n_i_raw| <= dlim  (broadcast nf over rows)
+                dn_ok = (cp.abs(nf_grid[None, :] - n_i_raw[:, None]) <= dlim)
+                prob = cp.where(dn_ok, prob, 0.0)
+
+            # Zero for inactive rows
+            prob = cp.where(active[:, None], prob, 0.0)
+
+            nf_idx = rowwise_categorical_sample(prob)
+
+            # WRITE BACK ONLY FOR ACTIVE ROWS
+            molecules_dev[active, axis] = nf_idx[active]
+
+            lost_axis = (nf_idx >= res.n_limit[axis]) & active
+            molecules_dev[lost_axis, 5] = 1
+
+        # decay to mN ∈ {-1,0,1} only for active rows
+        u = cp.random.random((N,), dtype=cp.float32)
+        new_state = cp.where(
+            u < cdf_decay[0],
+            -1,
+            cp.where(u < cdf_decay[1], 0, 1)
+        ).astype(cp.int32)
+        molecules_dev[active, 3] = new_state[active]
+
+        # branching to other spin only for active rows
+        u2 = cp.random.random((N,), dtype=cp.float32)
+        spun = active & (u2 < BRANCH_RATIO)
+        molecules_dev[spun, 4] = 1
+
+        cycles_used = cp.where(active, cycles_used + 1, cycles_used)
+
+    return cycles_used
+
+def op_test(
+    molecules_dev: cp.ndarray,
+    res: GPUResources,
+    K_max: int = 12,
+    delta_lim: int = None,
+    eta_op = 0.55,
+) -> cp.ndarray:
+    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 6:
+        raise ValueError("molecules_dev must be (N,6)")
+
+    if delta_lim is not None and int(delta_lim) < 0:
+        raise ValueError("delta_lim must be None or a nonnegative int")
+
+    N = molecules_dev.shape[0]
+    cycles_used = cp.zeros((N,), dtype=cp.int32)
+    max_n = res.max_n
+
+    decay_probs = cp.asarray(DECAY_RATIO, dtype=cp.float32)
+    decay_probs = decay_probs / decay_probs.sum()
+    cdf_decay = cp.cumsum(decay_probs)
+
+    # Precompute nf grid once (used for windowing)
+    # Note: Kf differs by axis, so we build per-axis inside the loop.
+
+    dlim = None if delta_lim is None else int(delta_lim)
+
+    for k in range(int(K_max)):
+        # apply only to state -1 or 0, good spin, not lost
+        is_m_minus1_or_0 = (molecules_dev[:, 3] == -1) | (molecules_dev[:, 3] == 0)
+        active = (molecules_dev[:, 5] == 0) & (molecules_dev[:, 4] == 0) & is_m_minus1_or_0
+        if not bool(active.any()):
+            break
+
+        for axis in [2]:
+            n_i_raw = molecules_dev[:, axis].astype(cp.int32)
+
+            eta = cp.zeros((N,), dtype=cp.float64) + eta_op
             ld_idx = ld_index_dithered(eta, res.LD_RES, res.ld_bins)
 
             Kf = int(max_n[axis])
