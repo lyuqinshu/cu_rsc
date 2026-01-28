@@ -404,15 +404,18 @@ def excecute_single_raman_pulse(
     k_max: int = 3,
 ) -> None:
     """
-    Execute a single (P,4) Raman pulse on-GPU (no sync).
+    Execute a single Raman pulse on-GPU (no sync).
 
-    Channels:
-      main: n -> n + d_n
-      off-res: n -> n + d_n ± j,  j = 1 ... k_max
-      detuning: Δ = Δ0 + |Δn_total| * detuning_trap_axis  (+ off-res ± j*ω_trap term)
+    Use d_n as a hint. Compute the nearest transition order using:
+        freq = Delta_carrier + d_n_hint * omega_trap
+        m_closest = round( freq / (omega_trap + delta_omega_trap) )
+    Then build channels for m = m_closest +/- j and use:
+        Delta(m) = Delta_carrier - m * omega_eff
     """
-    d_n_dev = cp.asarray(d_n, dtype=cp.int32)
-    N = molecules_dev.shape[0]
+
+    # --- hint and shapes ---
+    d_n_hint = cp.asarray(d_n, dtype=cp.int32)  # hint (scalar or per-element)
+    N = int(molecules_dev.shape[0])
 
     ok = (
         (molecules_dev[:, 5] == 0) &
@@ -427,82 +430,72 @@ def excecute_single_raman_pulse(
     eta_arr = cp.full((N,), eta_axis, dtype=cp.float64)
     ld_idx = _ld_index_from_eta(eta_arr, res.LD_RES, res.ld_bins)
 
-    delta_axis_ang = detuning_ang[axis].astype(cp.float64)
-    detune_trap_axis = detuning_trap[axis].astype(cp.float64)
+    # --- get axis scalars (safe coercions) ---
+    delta_axis_ang = cp.asarray(detuning_ang[axis], dtype=cp.float64)      # Δ_carrier (rad/s)
+    detune_trap_axis = cp.asarray(detuning_trap[axis], dtype=cp.float64)  # δω_trap (rad/s)
+    trap_axis = cp.asarray(res.trap_freq[axis], dtype=cp.float64)         # ω_trap (rad/s)
 
-    trap_axis = res.trap_freq[axis]
-    if not isinstance(trap_axis, cp.ndarray):
-        trap_axis = cp.asarray(trap_axis, dtype=cp.float64)
-    trap_axis = trap_axis.astype(cp.float64)
+    # effective spacing
+    omega_eff = trap_axis + detune_trap_axis
+    omega_eff_safe = cp.where(cp.abs(omega_eff) > 0, omega_eff, cp.asarray(1.0, dtype=cp.float64))
 
+    # Compute the scalar "freq" used to find nearest integer
+    # freq = Δ_carrier + d_n_hint * ω_trap
+    d_n_hint_f = d_n_hint.astype(cp.float64)
+    freq = delta_axis_ang + d_n_hint_f * trap_axis
+
+    # nearest order (elementwise if hint is array)
+    m_closest = cp.rint(freq / omega_eff_safe).astype(cp.int32)
+
+    # Effective center order we will use
+    d_n_eff = m_closest  # you can instead do biasing relative to hint if desired
+
+    # --- pulse constants ---
     Omega_ang_base = (2.0 * np.pi) * float(Omega_lin) * float(Rabi_scale)
     t_arr = cp.full((N,), float(t_sec), dtype=cp.float64)
-
     nlim = int(res.n_limit[axis])
 
     def broadcast_detuning(det):
         return cp.full((N,), 1.0, dtype=cp.float64) * det
 
     # --------------------------------------------------
-    # Build transition channels
+    # Build transition channels centered on d_n_eff
     # --------------------------------------------------
-    P_list = []
-    valid_list = []
-    n_f_list = []
+    P_list: list[cp.ndarray] = []
+    valid_list: list[cp.ndarray] = []
+    n_f_list: list[cp.ndarray] = []
 
-    # --- main (j = 0) ---
-    n_f0 = n_i + d_n_dev
-    valid0 = ok & (n_f0 >= 0)
-    sel = cp.where(valid0)[0]
+    def add_channel(m_order: cp.ndarray):
+        # m_order: integer order for the transition (can be scalar or array same-shape-as-hint)
+        n_f = n_i + m_order
+        valid = ok & (n_f >= 0)
+        sel = cp.where(valid)[0]
 
-    m0 = cp.zeros((N,), dtype=cp.float32)
-    if sel.size > 0:
-        m0[sel] = res.M[n_i[sel], n_f0[sel], ld_idx[sel]]
+        mfac = cp.zeros((N,), dtype=cp.float32)
+        if sel.size > 0:
+            mfac[sel] = res.M[n_i[sel], n_f[sel], ld_idx[sel]]
 
-    Omega0 = Omega_ang_base * m0.astype(cp.float64)
+        Omega = Omega_ang_base * mfac.astype(cp.float64)
 
-    # Δ = Δ0 - d_n * detuning_trap_axis
-    Delta0_scalar = delta_axis_ang - d_n_dev.astype(cp.float64) * detune_trap_axis
-    Delta0 = broadcast_detuning(Delta0_scalar)
-    P0 = rabi_transition_prob(Omega0, Delta0, t_arr)
-    P0 = cp.where(valid0, P0, 0.0)
+        # Δ(m) = freq - m * ω_eff
+        Delta_scalar = freq - m_order.astype(cp.float64) * omega_eff
+        Delta = broadcast_detuning(Delta_scalar)
 
-    P_list.append(P0.astype(cp.float32))
-    valid_list.append(valid0)
-    n_f_list.append(n_f0)
+        P = rabi_transition_prob(Omega, Delta, t_arr)
+        P = cp.where(valid, P, 0.0)
 
-    # --- off-resonant ±j ---
-    for j in range(1, k_max + 1):
-        for sign in (+1, -1):
-            j_dev = cp.asarray(sign * j, dtype=cp.int32)
+        P_list.append(P.astype(cp.float32))
+        valid_list.append(valid)
+        n_f_list.append(n_f)
 
-            n_fj = n_i + d_n_dev + j_dev
-            validj = ok & (n_fj >= 0)
-            sel = cp.where(validj)[0]
+    # main
+    add_channel(d_n_eff)
 
-            mj = cp.zeros((N,), dtype=cp.float32)
-            if sel.size > 0:
-                mj[sel] = res.M[n_i[sel], n_fj[sel], ld_idx[sel]]
-
-            Omegaj = Omega_ang_base * mj.astype(cp.float64)
-
-            # total phonon jump for this channel is (d_n + j_dev)
-            dn_tot = (d_n_dev + j_dev).astype(cp.float64)
-
-            # Δ = Δ0 + (± j*ω_trap) - (d_n ± j) * detuning_trap_axis
-            Deltaj_scalar = (
-                delta_axis_ang
-                + trap_axis * j_dev.astype(cp.float64)
-                - dn_tot * detune_trap_axis
-            )
-            Deltaj = broadcast_detuning(Deltaj_scalar)
-
-            Pj = rabi_transition_prob(Omegaj, Deltaj, t_arr)
-            Pj = cp.where(validj, Pj, 0.0)
-
-            P_list.append(Pj.astype(cp.float32))
-            valid_list.append(validj)
-            n_f_list.append(n_fj)
+    # off-res ±j
+    for j in range(1, int(k_max) + 1):
+        j_dev = cp.asarray(j, dtype=cp.int32)
+        add_channel(d_n_eff + j_dev)
+        add_channel(d_n_eff - j_dev)
 
     # --------------------------------------------------
     # Probabilistic selection
@@ -696,7 +689,7 @@ def raman_sideband_thermometry(
         freq = frequencys[i].astype(cp.float64)  # linear Hz (device scalar)
 
         # Choose nearest sideband order (device scalar)
-        d_n = cp.rint(freq / trap_hz).astype(cp.int32)
+        d_n = cp.rint(freq / (trap_hz + trap_detuning[axis])).astype(cp.int32)
 
         # Residual detuning to nearest transition (linear Hz -> angular rad/s), on device
         detuning_ang = cp.zeros((3,), dtype=cp.float64)
