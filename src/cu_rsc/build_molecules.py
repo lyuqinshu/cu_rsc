@@ -1,7 +1,7 @@
 """
 cu_rsc.build_molecules
 ----------------------
-GPU utilities to build an (N,6) molecule array with a **thermal** distribution
+GPU utilities to build an (N,7) molecule array with a **thermal** distribution
 of vibrational quanta along x, y, z.
 
 State layout (int32, device array):
@@ -11,6 +11,7 @@ State layout (int32, device array):
     molecules_dev[:, 3] = state   (mN)  [init: +1]
     molecules_dev[:, 4] = spin    [init: 0]
     molecules_dev[:, 5] = is_lost [init: 0]
+    molecules_dev[:, 6] = trap_det (Hz) the trap detuning of the tweezer site
 
 Sampling model per axis i:
     P(n_i = n) ∝ exp(- (n + 1/2) ħ ω_i / (k_B T_i)),  0 ≤ n ≤ n_cap
@@ -84,10 +85,11 @@ def _sample_from_probs(prob_row: cp.ndarray, N: int) -> cp.ndarray:
 # Public API
 # -----------------------------
 
-def build_thermal_molecules_gpu(
+def build_thermal_molecules(
     N: int,
     temps_K: Iterable[float],
     *,
+    detuning_sigma: float = 0,
     state_init: int = 1,
     spin_init: int = 0,
     seed: int | None = None,
@@ -98,6 +100,7 @@ def build_thermal_molecules_gpu(
     ----------
     N : number of molecules
     temps_K : iterable of 3 temperatures [Tx, Ty, Tz] in Kelvin
+    detuning_sigma: the trap detuning variation in axial direction among the sites (Hz)
     state_init : initial mN (default +1)
     spin_init : initial spin manifold (default 0)
     seed : optional RNG seed for reproducibility
@@ -126,8 +129,8 @@ def build_thermal_molecules_gpu(
         ns_i = _sample_from_probs(probs, N)
         ns.append(ns_i)
 
-    # Assemble (N,6) device array
-    mol = cp.zeros((N, 6), dtype=cp.int32)
+    # Assemble (N,7) device array
+    mol = cp.zeros((N, 7), dtype=cp.int32)
     mol[:, 0] = ns[0]
     mol[:, 1] = ns[1]
     mol[:, 2] = ns[2]
@@ -135,23 +138,21 @@ def build_thermal_molecules_gpu(
     mol[:, 4] = int(spin_init)   # spin good
     mol[:, 5] = 0                # not lost
 
+    # Trap detuning (Hz, integer)
+    sigma = float(detuning_sigma)
+    if sigma > 0.0:
+        det_hz = cp.random.normal(
+            loc=0.0,
+            scale=sigma,
+            size=(N,),
+            dtype=cp.float32,
+        )
+        mol[:, 6] = cp.rint(det_hz).astype(cp.int32)
+    else:
+        mol[:, 6] = 0
+
     return mol
 
-
-def build_thermal_molecules_host(
-    N: int,
-    temps_K: Iterable[float],
-    *,
-    state_init: int = 1,
-    spin_init: int = 0,
-    seed: int | None = None,
-) -> np.ndarray:
-    """CPU convenience wrapper: returns NumPy array by copying from device."""
-    dev = build_thermal_molecules_gpu(N, temps_K, state_init=state_init, spin_init=spin_init, seed=seed)
-    return cp.asnumpy(dev)
-
-
 __all__ = [
-    "build_thermal_molecules_gpu",
-    "build_thermal_molecules_host",
+    "build_thermal_molecules",
 ]

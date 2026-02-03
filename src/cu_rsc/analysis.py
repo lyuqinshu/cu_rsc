@@ -30,8 +30,8 @@ def get_n_distribution_gpu(
     counts_x, counts_y, counts_z : dict[int, int]
         Frequency counts for each vibrational number (on CPU).
     """
-    if mol_dev.ndim != 2 or mol_dev.shape[1] != 6:
-        raise ValueError("mol_dev must be shape (N,6)")
+    if mol_dev.ndim != 2 or mol_dev.shape[1] != 7:
+        raise ValueError("mol_dev must be shape (N,7)")
 
     if not isinstance(plot, (list, tuple)) or len(plot) != 3:
         raise ValueError("plot must be a list or tuple of 3 booleans [x, y, z]")
@@ -111,8 +111,8 @@ def bootstrap_stats_from_molecules(
     if rng is None:
         rng = cp.random
 
-    if molecules.ndim != 2 or molecules.shape[1] != 6:
-        raise ValueError("molecules must be (N,6)")
+    if molecules.ndim != 2 or molecules.shape[1] != 7:
+        raise ValueError("molecules must be (N,7)")
 
     N = molecules.shape[0]
     if N == 0:

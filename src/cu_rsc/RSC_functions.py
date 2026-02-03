@@ -2,7 +2,7 @@
 GPU-accelerated Raman sideband cooling primitives using CuPy.
 
 State layout (SoA-in-a-matrix):
-    molecules: (N, 6) int32 array on **device** with columns
+    molecules: (N, 7) int32 array on **device** with columns
         [nx, ny, nz, state, spin, is_lost]
       - nx, ny, nz: vibrational quanta (>=0)
       - state: mN value in {-1, 0, 1}
@@ -275,8 +275,8 @@ def optical_pumping(
     K_max: int = 12,
     delta_lim: int = None,
 ) -> cp.ndarray:
-    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 6:
-        raise ValueError("molecules_dev must be (N,6)")
+    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 7:
+        raise ValueError("molecules_dev must be (N,7)")
 
     if delta_lim is not None and int(delta_lim) < 0:
         raise ValueError("delta_lim must be None or a nonnegative int")
@@ -393,28 +393,31 @@ def excecute_single_raman_pulse(
     molecules_dev: cp.ndarray,
     *,
     axis: int,
-    d_n,                  # int OR CuPy scalar
+    d_n,                  # int OR CuPy scalar OR (N,) array
     Omega_lin: float,     # Hz (linear)
     t_sec: float,         # seconds
     res: GPUResources,
     LD_raman_vec: cp.ndarray,
-    detuning_ang: cp.ndarray,   # (3,) rad/s (CuPy)
-    detuning_trap: cp.ndarray,  # (3,) rad/s (CuPy) 
-    Rabi_scale: cp.ndarray,  # (3,)
+    detuning_ang: cp.ndarray,   # (3,) rad/s (CuPy)  <-- LASER detuning (global)
+    detuning_trap: cp.ndarray,  # (3,) rad/s (CuPy)  <-- global trap detuning
+    Rabi_scale: cp.ndarray,     # (3,)
     k_max: int = 3,
 ) -> None:
     """
     Execute a single Raman pulse on-GPU (no sync).
 
-    Use d_n as a hint. Compute the nearest transition order using:
+    Per-molecule site detuning DOES NOT change laser detuning.
+    It only modifies the site-dependent trap frequency spacing:
+
+        omega_eff_i = omega_trap + detuning_trap_axis + 2π * molecules_dev[:,6]   (rad/s)
+
+    Then:
         freq = Delta_carrier + d_n_hint * omega_trap
-        m_closest = round( freq / (omega_trap + delta_omega_trap) )
-    Then build channels for m = m_closest +/- j and use:
-        Delta(m) = Delta_carrier - m * omega_eff
+        m_closest_i = round(freq / omega_eff_i)
+        Delta_i(m) = Delta_carrier - m * omega_eff_i
     """
 
-    # --- hint and shapes ---
-    d_n_hint = cp.asarray(d_n, dtype=cp.int32)  # hint (scalar or per-element)
+    d_n_hint = cp.asarray(d_n, dtype=cp.int32)
     N = int(molecules_dev.shape[0])
 
     ok = (
@@ -430,33 +433,32 @@ def excecute_single_raman_pulse(
     eta_arr = cp.full((N,), eta_axis, dtype=cp.float64)
     ld_idx = _ld_index_from_eta(eta_arr, res.LD_RES, res.ld_bins)
 
-    # --- get axis scalars (safe coercions) ---
-    delta_axis_ang = cp.asarray(detuning_ang[axis], dtype=cp.float64)      # Δ_carrier (rad/s)
-    detune_trap_axis = cp.asarray(detuning_trap[axis], dtype=cp.float64)  # δω_trap (rad/s)
-    trap_axis = cp.asarray(res.trap_freq[axis], dtype=cp.float64)         # ω_trap (rad/s)
+    # --- axis scalars ---
+    Delta_carrier = cp.asarray(detuning_ang[axis], dtype=cp.float64)       # rad/s (global)
+    detune_trap_axis = cp.asarray(detuning_trap[axis], dtype=cp.float64)   # rad/s (global)
+    trap_axis = cp.asarray(res.trap_freq[axis], dtype=cp.float64)          # rad/s (nominal)
 
-    # effective spacing
-    omega_eff = trap_axis + detune_trap_axis
-    omega_eff_safe = cp.where(cp.abs(omega_eff) > 0, omega_eff, cp.asarray(1.0, dtype=cp.float64))
+    # --- per-molecule site-dependent trap frequency offset ---
+    # molecules_dev[:,6] is integer Hz -> rad/s
+    site_det_hz = molecules_dev[:, 6].astype(cp.float64)
+    site_det_ang = (2.0 * np.pi) * site_det_hz                             # (N,) rad/s
 
-    # Compute the scalar "freq" used to find nearest integer
-    # freq = Δ_carrier + d_n_hint * ω_trap
-    d_n_hint_f = d_n_hint.astype(cp.float64)
-    freq = delta_axis_ang + d_n_hint_f * trap_axis
+    # per-molecule effective spacing
+    omega_eff = trap_axis + detune_trap_axis + site_det_ang                 # (N,) rad/s
+    omega_eff_safe = cp.where(cp.abs(omega_eff) > 0, omega_eff, 1.0)
 
-    # nearest order (elementwise if hint is array)
+    # Compute scalar/array freq used for nearest order:
+    # freq = Δ_carrier + d_n_hint * ω_trap  (Δ_carrier global; ω_trap nominal)
+    freq = Delta_carrier + d_n_hint.astype(cp.float64) * trap_axis          # scalar or (N,)
+
+    # nearest order per molecule
     m_closest = cp.rint(freq / omega_eff_safe).astype(cp.int32)
-
-    # Effective center order we will use
-    d_n_eff = m_closest  # you can instead do biasing relative to hint if desired
+    d_n_eff = m_closest
 
     # --- pulse constants ---
     Omega_ang_base = (2.0 * np.pi) * float(Omega_lin) * float(Rabi_scale[axis])
     t_arr = cp.full((N,), float(t_sec), dtype=cp.float64)
     nlim = int(res.n_limit[axis])
-
-    def broadcast_detuning(det):
-        return cp.full((N,), 1.0, dtype=cp.float64) * det
 
     # --------------------------------------------------
     # Build transition channels centered on d_n_eff
@@ -466,8 +468,9 @@ def excecute_single_raman_pulse(
     n_f_list: list[cp.ndarray] = []
 
     def add_channel(m_order: cp.ndarray):
-        # m_order: integer order for the transition (can be scalar or array same-shape-as-hint)
+        m_order = cp.asarray(m_order, dtype=cp.int32)  # scalar or (N,)
         n_f = n_i + m_order
+
         valid = ok & (n_f >= 0)
         sel = cp.where(valid)[0]
 
@@ -477,9 +480,9 @@ def excecute_single_raman_pulse(
 
         Omega = Omega_ang_base * mfac.astype(cp.float64)
 
-        # Δ(m) = freq - m * ω_eff
-        Delta_scalar = freq - m_order.astype(cp.float64) * omega_eff
-        Delta = broadcast_detuning(Delta_scalar)
+        # IMPORTANT: per-molecule detuning via omega_eff (site dependent)
+        # Delta_i(m) = freq - m * omega_eff_i
+        Delta = freq - m_order.astype(cp.float64) * omega_eff      # (N,)
 
         P = rabi_transition_prob(Omega, Delta, t_arr)
         P = cp.where(valid, P, 0.0)
@@ -558,8 +561,8 @@ def raman_cool_with_pumping(
         - scalar (backwards compatible): same scale for all axes
         - (3,) array-like: per-axis scale [sx, sy, sz]
     """
-    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 6:
-        raise ValueError("molecules_dev must be (N,6)")
+    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 7:
+        raise ValueError("molecules_dev must be (N,7)")
 
     pulses = np.asarray(pulses_dev, dtype=float)
     if pulses.ndim != 2 or pulses.shape[1] not in (3, 4):
@@ -641,7 +644,7 @@ def raman_sideband_thermometry(
     Simulate Raman sideband thermometry without GPU synchronization.
 
     Parameters:
-        molecules_dev: (N,6) array of molecules on device
+        molecules_dev: (N,7) array of molecules on device
         axis: 0, 1, or 2 for the trap axis to probe
         frequencys: (F,) array of Raman probe frequencies (linear Hz) on device
         rabi_freq: Rabi frequency (linear Hz) of the Raman probe
@@ -651,7 +654,7 @@ def raman_sideband_thermometry(
         show_progress: whether to show a progress bar
         k_max: maximum off-resonant sideband order to include
     """
-    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 6:
+    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 7:
         raise ValueError("molecules_dev must be (N,6)")
     if axis not in (0, 1, 2):
         raise ValueError("axis must be 0, 1, or 2")
@@ -728,34 +731,6 @@ def raman_sideband_thermometry(
 # -------------------------
 # Convenience
 # -------------------------
-
-def make_device_molecules(mols_host_n_by_6: np.ndarray) -> cp.ndarray:
-    if mols_host_n_by_6.ndim != 2 or mols_host_n_by_6.shape[1] != 6:
-        raise ValueError("Input must be (N,6)")
-    return cp.asarray(mols_host_n_by_6, dtype=cp.int32)
-
-def make_device_pulses(pulses_host: np.ndarray) -> cp.ndarray:
-    """
-    Convert host pulses to device array.
-
-    Accepts:
-        - (P,3): [axis, delta_n, Omega_t]
-        - (P,4): [axis, delta_n, Omega_lin (Hz), t_sec]
-
-    axis and delta_n are rounded to integers; other columns are left as floats.
-    """
-    if pulses_host.ndim != 2 or pulses_host.shape[1] not in (3, 4):
-        raise ValueError("pulses must be (P,3) or (P,4)")
-
-    arr = np.asarray(pulses_host, dtype=float)
-
-    # Discrete columns
-    arr[:, 0] = np.rint(arr[:, 0])  # axis
-    arr[:, 1] = np.rint(arr[:, 1])  # delta_n
-
-    # Remaining columns are continuous (Omega_t or Omega_lin, t_sec)
-    return cp.asarray(arr, dtype=cp.float64)
-
 
 def count_survivors(molecules_dev: cp.ndarray) -> int:
     ok = (molecules_dev[:, 5] == 0) & (molecules_dev[:, 4] == 0) & (molecules_dev[:, 3] == 1)
