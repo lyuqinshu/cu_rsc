@@ -400,7 +400,7 @@ def excecute_single_raman_pulse(
     LD_raman_vec: cp.ndarray,
     detuning_ang: cp.ndarray,   # (3,) rad/s (CuPy)
     detuning_trap: cp.ndarray,  # (3,) rad/s (CuPy) 
-    Rabi_scale: float,
+    Rabi_scale: cp.ndarray,  # (3,)
     k_max: int = 3,
 ) -> None:
     """
@@ -451,7 +451,7 @@ def excecute_single_raman_pulse(
     d_n_eff = m_closest  # you can instead do biasing relative to hint if desired
 
     # --- pulse constants ---
-    Omega_ang_base = (2.0 * np.pi) * float(Omega_lin) * float(Rabi_scale)
+    Omega_ang_base = (2.0 * np.pi) * float(Omega_lin) * float(Rabi_scale[axis])
     t_arr = cp.full((N,), float(t_sec), dtype=cp.float64)
     nlim = int(res.n_limit[axis])
 
@@ -538,34 +538,25 @@ def raman_cool_with_pumping(
     *,
     K_max: int = 12,
     show_progress: bool = False,
-    Rabi_scale: float = 1.0,
+    Rabi_scale: Union[float, Sequence[float], np.ndarray, cp.ndarray] = 1.0,
     central_detuning: Sequence[float] = (0.0, 0.0, 0.0),  # per-axis laser detuning in linear Hz
-    trap_detuning: Sequence[float] = (0.0, 0.0, 0.0), # per-axis trap frequency detuning in linear Hz
+    trap_detuning: Sequence[float] = (0.0, 0.0, 0.0),     # per-axis trap frequency detuning in linear Hz
     k_max: int = 3,
     delta_lim: int = None,
 ) -> None:
     """
     GPU Raman + optical pumping simulation (no GPU sync inside).
 
-    Pulse layout:
+    pulses: (P,4) expected:
+        pulses[p] = [axis, delta_n, Omega_lin, t_sec]
+          axis: int in {0,1,2}
+          delta_n: int (hint)
+          Omega_lin: Hz (linear)
+          t_sec: seconds
 
-        - New (P,4):
-            pulses[p] = [axis, delta_n, Omega_lin, t_sec]
-            Omega_lin: Rabi frequency in Hz (linear)
-            t_sec:     pulse duration in seconds
-
-            Internally:
-                Omega_ang = 2π * Omega_lin * Rabi_scale   (rad/s)
-                Δ_axis    = 2π * Detuning[axis]           (rad/s)
-
-            Channels:
-                main: n -> n + delta_n, detuning Δ = Δ_axis
-                up:   n -> n + delta_n + 1, detuning Δ = Δ_axis + ω_trap
-                down: n -> n + delta_n - 1, detuning Δ = Δ_axis - ω_trap
-
-    Detuning:
-        Detuning = (delta_x, delta_y, delta_z) in linear Hz.
-        Detuning = (0,0,0) reproduces the old behavior (downwards compatible).
+    Rabi_scale:
+        - scalar (backwards compatible): same scale for all axes
+        - (3,) array-like: per-axis scale [sx, sy, sz]
     """
     if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 6:
         raise ValueError("molecules_dev must be (N,6)")
@@ -574,9 +565,19 @@ def raman_cool_with_pumping(
     if pulses.ndim != 2 or pulses.shape[1] not in (3, 4):
         raise ValueError("pulses must be (P,3) or (P,4)")
 
-    N = molecules_dev.shape[0]
+    N = int(molecules_dev.shape[0])
     if N == 0:
         return
+
+    # ---------------------------
+    # Normalize Rabi_scale to (3,) on GPU
+    # ---------------------------
+    if np.isscalar(Rabi_scale):
+        Rabi_scale_dev = cp.full((3,), float(Rabi_scale), dtype=cp.float64)
+    else:
+        Rabi_scale_dev = cp.asarray(Rabi_scale, dtype=cp.float64).ravel()
+        if Rabi_scale_dev.size != 3:
+            raise ValueError("Rabi_scale must be a scalar or length-3 array-like (sx, sy, sz)")
 
     LD_raman_vec = cp.asarray(LD_RAMAN, dtype=cp.float64)
 
@@ -589,6 +590,7 @@ def raman_cool_with_pumping(
         2.0 * np.pi * np.asarray(trap_detuning, dtype=float),
         dtype=cp.float64,
     )
+
     pulse_iter = tqdm(range(pulses.shape[0]), desc="Raman pulses", disable=not show_progress)
     n_cols = pulses.shape[1]
 
@@ -596,11 +598,11 @@ def raman_cool_with_pumping(
         axis = int(pulses[p, 0])
         d_n = int(pulses[p, 1])
 
-        # -----------------------------------
-        # New (P,4) behavior moved into excecute_single_raman_pulse (no sync)
-        # -----------------------------------
-        Omega_lin = float(pulses[p, 2])  # Hz
-        t_sec = float(pulses[p, 3])      # s
+        if n_cols == 3:
+            raise ValueError("pulses (P,3) not supported in this path; please provide (P,4)")
+        else:
+            Omega_lin = float(pulses[p, 2])  # Hz
+            t_sec = float(pulses[p, 3])      # s
 
         excecute_single_raman_pulse(
             molecules_dev,
@@ -612,7 +614,7 @@ def raman_cool_with_pumping(
             LD_raman_vec=LD_raman_vec,
             detuning_ang=detuning_ang,
             detuning_trap=detuning_trap_ang,
-            Rabi_scale=Rabi_scale,
+            Rabi_scale=Rabi_scale_dev,
             k_max=k_max,
         )
 
@@ -705,7 +707,7 @@ def raman_sideband_thermometry(
             LD_raman_vec=LD_raman_vec,
             detuning_ang=detuning_ang,
             detuning_trap=detuning_trap,  
-            Rabi_scale=1.0,
+            Rabi_scale=[1, 1, 1],
             k_max=k_max,
         )
 
@@ -721,8 +723,6 @@ def raman_sideband_thermometry(
         )
 
     return frequencys, polarizations
-
-
 
 
 # -------------------------
