@@ -13,38 +13,20 @@ The package features GPU acceleration
 Example:
 ```python
 {
-  "mass": 123.0,                 # amu
+  "mass": 123.0,                 # Mass of the partical in the unit of amu
   "trap_freq": [80e3, 80e3, 20e3], # Hz for x,y,z (converted internally to rad/s)
-  "lambda": 531e-9,             # m (e.g., 531 nm)
-  "decay_ratio": [0.25, 0.25, 0.5], # P(mN=-1,0,1) after OP
+  "lambda": 531e-9,             # Wavelength of the cooling light, in meter (e.g., 531 nm)
+  "decay_ratio": [0.25, 0.25, 0.5], # Decaying ratio P(mN=-1,0,1) after OP
   "branch_ratio": 0.05,          # probability to switch spin manifold during OP
   "trap_depth": 200e-6,          # Kelvin
   "max_n": [200, 200, 200],      # n cutoff per axis for M table and OP, should be larger than the trap depth
   "LD_RES": 0.01,                # η grid resolution
-  "LD_MIN": 0.0,
-  "LD_MAX": 3.0,
+  "LD_MIN": 0.0,                 # Minimum η to calculate
+  "LD_MAX": 3.0,                 # Maximum η to calculate
   "angle_pump_sigma": [1.57, 0.0], # [theta, phi] rad for σ-pump, referenced to the axial trap axis
   "angle_pump_pi":    [0.0, 0.0],  # [theta, phi] rad for π-pump, referenced to the axial trap axis
   "LD_raman": [0.5, 0.5, 0.3],    # |Δk|x0 per axis used for Raman pulses
 
-  # Amplitude of the pulses in each axis, in format of "Axis" : [-1, -2, ...], Rabi frequency scaled linearly to amplitude
-  "amp_matrix": {
-    "0": [0.92],
-    "X": [0.3, 0.65, 0.65, 0.7, 0.7, 0.85],
-    "Y": [0.3, 0.65, 0.65, 0.7, 0.7, 0.85],
-    "Z": [0.14, 0.14, 0.14, 0.28, 0.28, 0.35, 0.35, 0.4, 0.4]
-  },
-
-  # Duration of the pulses in each axis, in format of "Axis" : [-1, -2, ...], in the unit of second
-  # The scaling is such that amp[-2]*duration[-2]*scale = pi/0.3
-  "duration_matrix": {
-    "OP": [8e-5],
-    "CO": [1e-4],
-    "X":  [5e-5, 7e-5, 7e-5, 9e-5, 9e-5, 11e-5],
-    "Y":  [5e-5, 7e-5, 7e-5, 9e-5, 9e-5, 11e-5],
-    "Z":  [2e-4, 2e-4, 2e-4, 5e-5, 5e-5, 7e-5, 7e-5, 9e-5, 9e-5]
-  }
-}
 ```
 
 ---
@@ -60,35 +42,50 @@ res   = cr.resources_from_config(M_dev)
 ```
 
 ### Initialize molecules
+
+A molecule sample should be a cupy array with shape (N, 7)
+Each row contains (nx, ny, nz, mN, spin, is_lost, teap_freq)
+To initialize a thermal sample of molecules:
 ```python
 temp = [25e-6, 25e-6, 25e-6]
 n = int(1e6)
-mols_gpu = cr.build_thermal_molecules_gpu(n, temp)
+mols = cr.build_thermal_molecules(n, temp)
 ```
+You can also add a trap frequency deviation to the sample to simulate an inhomogeneous tweezer array.
 
 ### Generate RSC pulses
+All raman pulse sequence should be in the form of (N, 4) numpy array
+N is the number of the pulse, each pulse in the convension of (axis, Δn, Ω, t)
+For example, a sequence of a single pulse cooling in Z axis with Δn=-1, Rabi frequency of 2π*3kHz and a pulse duration of 20μs should be
+
 ```python
-original_gpu = cr.get_original_sequences_gpu()  # list/tuple of cp.ndarray blocks
-
-# Repeat each block along the first axis, then concatenate in order
-blocks = [
-    cp.tile(original_gpu[0], (10, 1)),  # repeat 10 times
-    cp.tile(original_gpu[1], (5,  1)),  # repeat 5 times
-    cp.tile(original_gpu[2], (5,  1)),  # repeat 5 times
-    cp.tile(original_gpu[3], (10, 1)),  # repeat 10 times
-    cp.tile(original_gpu[4], (10, 1)),  # repeat 10 times
-]
-
-seq_gpu = cp.concatenate(blocks, axis=0)
+sequence = np.array([[2, -1, 3e3, 20e-6]])
 ```
 
 ### Apply pulses
+
+Applying the pulse will directly change the molecule array.
 ```python
-cr.raman_cool_with_pumping(mols_gpu, seq_gpu, res)
+cr.raman_cool_with_pumping(
+  mols,
+  sequence,
+  res)
 ```
+Detuning, off-resonance drive and more options are available.
 
 ---
 
+### Analyze sample
+You can read the state distribution of the molecule sample
+
+```python
+dist = cr.get_n_distribution_gpu(mols, max_bins=10, plot=(True, True, True))
+result = cr.bootstrap_stats_from_molecules(mol_0)
+
+print("survival rate: ", np.round(result["survival_rate_mean"], 3))
+print("N_z bar: ", np.round(result["mot_mean"][2], 3))
+print("Ground state rate: ", np.round(result["ground_state_rate_mean"],3))
+```
 
 ## Performance benchmark
 The run speed has a significant improvment on GPU compare to on CPU.
