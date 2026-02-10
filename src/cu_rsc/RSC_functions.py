@@ -388,6 +388,30 @@ def rabi_transition_prob(omega: cp.ndarray, delta: cp.ndarray, t: cp.ndarray) ->
     phase = 0.5 * om_eff * t
     return base * cp.sin(phase) ** 2
 
+def lz_adiabatic_prob(Omega, Delta, t) -> cp.ndarray:
+    """
+    Landau–Zener adiabatic transfer probability for a linear sweep
+    from -Delta to +Delta in time t.
+
+        P = 1 - exp( -π Ω^2 t / (4 Δ) )
+
+    Omega : rad/s (scalar or array)
+    Delta : rad/s (scalar or array)
+    t     : s     (scalar or array)
+    """
+    Omega = cp.asarray(Omega, dtype=cp.float64)
+    Delta = cp.asarray(Delta, dtype=cp.float64)
+    t     = cp.asarray(t,     dtype=cp.float64)
+
+    Omega2 = Omega * Omega
+
+    # Avoid divide-by-zero and negative Delta
+    # (Delta should be >0 physically; clamp to +inf if <=0 so exponent -> 0 and P -> 0)
+    safe_Delta = cp.where(Delta > 0.0, Delta, cp.inf)
+
+    exponent = -cp.pi * Omega2 * t / (4.0 * safe_Delta)
+    return 1.0 - cp.exp(exponent)
+
 
 def excecute_single_raman_pulse(
     molecules_dev: cp.ndarray,
@@ -533,6 +557,108 @@ def excecute_single_raman_pulse(
 
     molecules_dev[:, axis] = cp.maximum(molecules_dev[:, axis], 0)
 
+def blow_pulse(molecules_dev: cp.ndarray) -> None:
+    """
+    Mark molecules as lost if they are in mN = -1 (state col 3) OR spin = 1 (spin col 4).
+
+    molecules_dev layout: (N,7) int32 on GPU
+        [nx, ny, nz, mN(state), spin, is_lost, trap_det]
+    """
+    to_blow = (molecules_dev[:, 3] == -1) | (molecules_dev[:, 4] == 1)
+    molecules_dev[to_blow, 5] = 1
+
+
+def apply_lz_sweep(
+    molecules_dev: cp.ndarray,
+    *,
+    axis: int,
+    d_n: int,              # intended motional change
+    Omega_lin: float,      # linear Hz
+    Delta_sweep: float,    # linear Hz (half sweep range)
+    t_sec: float,          # sweep time (s)
+    res: GPUResources,
+    Rabi_scale: cp.ndarray = cp.array([1, 1, 1])   # (3,)
+) -> None:
+    """
+    Apply a single Landau–Zener sweep (main channel only).
+
+    Assumptions:
+      - Delta_sweep is a scalar float in linear Hz
+      - Omega_lin is a scalar float in linear Hz
+      - Effective 2-level LZ dynamics
+      - No trap shifts or detuning
+      - No off-resonant channels
+
+    Successful transition:
+      mN = +1  -->  -1
+      n  = n0  -->  n0 + d_n
+    """
+
+    N = int(molecules_dev.shape[0])
+
+    # ----------------------------
+    # Select valid molecules
+    # ----------------------------
+    ok = (
+        (molecules_dev[:, 5] == 0) &   # not lost
+        (molecules_dev[:, 3] == 1) &   # mN = +1
+        (molecules_dev[:, 4] == 0)     # correct spin manifold
+    )
+
+    n_i = molecules_dev[:, axis].astype(cp.int32)
+    n_f = n_i + int(d_n)
+
+    valid = ok & (n_f >= 0)
+
+    # ----------------------------
+    # LD matrix element
+    # ----------------------------
+    LD_raman_vec = cp.asarray(LD_RAMAN, dtype=cp.float64)
+    eta_axis = cp.abs(LD_raman_vec[axis]).astype(cp.float64)
+    eta_arr = cp.full((N,), eta_axis, dtype=cp.float64)
+    ld_idx = _ld_index_from_eta(eta_arr, res.LD_RES, res.ld_bins)
+
+    mfac = cp.zeros((N,), dtype=cp.float64)
+    sel = cp.where(valid)[0]
+    if sel.size > 0:
+        mfac[sel] = res.M[n_i[sel], n_f[sel], ld_idx[sel]]
+
+    # ----------------------------
+    # Convert to angular units
+    # ----------------------------
+    Omega_ang = (
+        2.0 * cp.pi
+        * float(Omega_lin)
+        * float(Rabi_scale[axis])
+        * mfac
+    )  # (N,) rad/s
+
+    Delta_ang = 2.0 * cp.pi * float(Delta_sweep)   # scalar rad/s
+    t_arr = cp.full((N,), float(t_sec), dtype=cp.float64)
+
+    # ----------------------------
+    # Landau–Zener probability
+    # ----------------------------
+    P = lz_adiabatic_prob(Omega_ang, Delta_ang, t_arr)
+    P = cp.where(valid, P, 0.0).astype(cp.float32)
+
+    # ----------------------------
+    # Stochastic application
+    # ----------------------------
+    r = cp.random.random((N,), dtype=cp.float32)
+    apply = (r < P) & valid
+
+    molecules_dev[apply, axis] = n_f[apply]
+    molecules_dev[apply, 3] = -1   # mN flip
+
+    # ----------------------------
+    # Loss handling
+    # ----------------------------
+    nlim = int(res.n_limit[axis])
+    lost_now = apply & (n_f >= nlim)
+    molecules_dev[lost_now, 5] = 1
+
+    molecules_dev[:, axis] = cp.maximum(molecules_dev[:, axis], 0)
 
 def raman_cool_with_pumping(
     molecules_dev: cp.ndarray,

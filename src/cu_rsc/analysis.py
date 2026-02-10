@@ -94,18 +94,19 @@ def bootstrap_stats_from_molecules(
 ) -> dict[str, cp.ndarray]:
     """
     Compute bootstrap statistics directly on GPU (no synchronization).
-    cols: [n_x, n_y, n_z, mN, spin, is_lost]
+    cols: [n_x, n_y, n_z, mN, spin, is_lost, (optional extra col...)]
 
     Returns a dict of cp.ndarray:
       - survival_rate_mean (scalar cp array)
       - survival_rate_sem  (scalar cp array)
-      - mot_mean (3,)
-      - mot_sem  (3,)
+      - mot_mean (3,)                     <-- conditioned on survival
+      - mot_sem  (3,)                     <-- conditioned on survival
       - ground_state_rate_mean (scalar)
       - ground_state_rate_sem  (scalar)
 
     Survival: (mN == 1) & (spin == 0) & (is_lost == 0)
-    Ground-state (not conditioned on survive): (n_x==0)&(n_y==0)&(n_z==0)&(is_lost==0)
+    Ground-state (conditioned on survive): (n_x==0)&(n_y==0)&(n_z==0)&(is_lost==0)
+    Motional stats: conditioned on survival (computed ONLY over survivors).
     """
 
     if rng is None:
@@ -114,7 +115,7 @@ def bootstrap_stats_from_molecules(
     if molecules.ndim != 2 or molecules.shape[1] != 7:
         raise ValueError("molecules must be (N,7)")
 
-    N = molecules.shape[0]
+    N = int(molecules.shape[0])
     if N == 0:
         raise ValueError("molecules is empty")
 
@@ -130,55 +131,68 @@ def bootstrap_stats_from_molecules(
     non_lost = (is_lost == 0)
     in_gnd   = (n_x == 0) & (n_y == 0) & (n_z == 0) & non_lost
 
-    def _stats_on_indices(idx: cp.ndarray):
-        idx = idx.astype(cp.int64, copy=False)
-        surv = survived[idx]
-        nl   = non_lost[idx]
-        gnd  = in_gnd[idx]
+    # -------------------------
+    # Point estimates
+    # -------------------------
+    surv_rate_0 = survived.mean()
 
-        surv_rate = surv.mean() if surv.size > 0 else cp.asarray(0.0)
+    denom = non_lost.sum()
+    g_rate_0 = in_gnd[non_lost].mean() if denom > 0 else cp.asarray(0.0)
 
-        # Ground-state rate among non-lost
-        denom = nl.sum()
-        g_rate = gnd[nl].mean() if denom > 0 else cp.asarray(0.0)
+    # Motional mean conditioned on survival (use survivors only)
+    surv_idx_all = cp.where(survived)[0]
+    Ns = int(surv_idx_all.size)
 
-        # Motional means conditioned on survive
-        if surv.any():
-            nx_mean = n_x[idx][surv].mean()
-            ny_mean = n_y[idx][surv].mean()
-            nz_mean = n_z[idx][surv].mean()
-        else:
-            nx_mean = ny_mean = nz_mean = cp.asarray(0.0)
+    if Ns > 0:
+        mot_vec_0 = cp.stack([
+            n_x[surv_idx_all].mean(),
+            n_y[surv_idx_all].mean(),
+            n_z[surv_idx_all].mean(),
+        ]).astype(cp.float64)
+    else:
+        mot_vec_0 = cp.zeros((3,), dtype=cp.float64)
 
-        mot_vec = cp.stack([nx_mean, ny_mean, nz_mean])
-        return surv_rate, mot_vec, g_rate
-
-    # Point estimate (full cohort)
-    full_idx = cp.arange(N)
-    surv_rate_0, mot_vec_0, g_rate_0 = _stats_on_indices(full_idx)
-
+    # -------------------------
     # Bootstrap resampling
+    # -------------------------
     surv_rates = cp.empty(B, dtype=cp.float64)
-    mot_vecs   = cp.empty((B, 3), dtype=cp.float64)
     g_rates    = cp.empty(B, dtype=cp.float64)
+    mot_vecs   = cp.empty((B, 3), dtype=cp.float64)
 
     for b in range(B):
-        idx_b = rng.randint(0, N, size=N)
-        sr, mv, gr = _stats_on_indices(idx_b)
-        surv_rates[b] = sr
-        mot_vecs[b, :] = mv
-        g_rates[b] = gr
+        # Resample full cohort for survival + ground-state stats
+        idx_b = rng.randint(0, N, size=N).astype(cp.int64, copy=False)
 
-    # Standard errors (on GPU)
+        surv_b = survived[idx_b]
+        nl_b   = non_lost[idx_b]
+        gnd_b  = in_gnd[idx_b]
+
+        surv_rates[b] = surv_b.mean() if surv_b.size > 0 else 0.0
+
+        denom_b = nl_b.sum()
+        g_rates[b] = gnd_b[nl_b].mean() if denom_b > 0 else 0.0
+
+        # Resample survivors ONLY for motional stats (conditional on survival)
+        if Ns > 0:
+            # sample from survivor index list with replacement
+            pick = rng.randint(0, Ns, size=Ns)
+            sidx = surv_idx_all[pick]
+
+            mot_vecs[b, 0] = n_x[sidx].mean()
+            mot_vecs[b, 1] = n_y[sidx].mean()
+            mot_vecs[b, 2] = n_z[sidx].mean()
+        else:
+            mot_vecs[b, :] = 0.0
+
+    # Standard errors (keep your existing convention)
     Bf = cp.asarray(float(B))
     inv_sqrtB = 1.0 / cp.sqrt(Bf)
 
     sem_surv = surv_rates.std(ddof=1) * inv_sqrtB
-    sem_mot  = mot_vecs.std(axis=0, ddof=1) * inv_sqrtB
     sem_gnd  = g_rates.std(ddof=1) * inv_sqrtB
+    sem_mot  = mot_vecs.std(axis=0, ddof=1) * inv_sqrtB
 
-    # Pack results — all GPU arrays
-    out = {
+    return {
         "survival_rate_mean": surv_rate_0,
         "survival_rate_sem": sem_surv,
         "mot_mean": mot_vec_0,
@@ -186,9 +200,10 @@ def bootstrap_stats_from_molecules(
         "ground_state_rate_mean": g_rate_0,
         "ground_state_rate_sem": sem_gnd,
         "N": cp.asarray(N, dtype=cp.int32),
+        "Ns_surv": cp.asarray(Ns, dtype=cp.int32),
         "B": cp.asarray(B, dtype=cp.int32),
     }
-    return out
+
 
 def save_molecules(molecules, filename: str | Path) -> None:
     """
