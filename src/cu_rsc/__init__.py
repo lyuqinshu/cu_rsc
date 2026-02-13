@@ -1,7 +1,7 @@
 from .RSC_functions import (
     set_seed, to_device_m_table, GPUResources,
     optical_pumping, raman_cool_with_pumping,
-    count_survivors, ground_state_rate, load_m_table_device,
+    load_m_table_device,
     resources_from_config, raman_sideband_thermometry,
     apply_lz_sweep, blow_pulse,
 )

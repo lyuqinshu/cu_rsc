@@ -10,10 +10,12 @@ State layout (SoA-in-a-matrix):
       - is_lost: 0 (active) or 1 (lost)
 
 Pulse layout:
-    pulses: (P, 3) array with rows [axis, delta_n, time]
+    pulses: (P, 5) array with rows [axis, delta_n, omega, time, detuning]
       - axis ∈ {0,1,2}
       - delta_n: int
-      - time: float (in units of 1/Ω0)
+      - omega: float (linear Rabi frequency in Hz)
+      - time: float (in units of s)
+      - detuning: float (in Hz)
 
 Notes:
     - All experiment parameters are loaded from config.json at import.
@@ -275,8 +277,9 @@ def optical_pumping(
     K_max: int = 12,
     delta_lim: int = None,
 ) -> cp.ndarray:
-    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 7:
-        raise ValueError("molecules_dev must be (N,7)")
+    # now expects (N,8)
+    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 8:
+        raise ValueError("molecules_dev must be (N,8)")
 
     if delta_lim is not None and int(delta_lim) < 0:
         raise ValueError("delta_lim must be None or a nonnegative int")
@@ -291,9 +294,6 @@ def optical_pumping(
 
     angle_sigma = ANGLE_PUMP_SIGMA
     angle_pi    = ANGLE_PUMP_PI
-
-    # Precompute nf grid once (used for windowing)
-    # Note: Kf differs by axis, so we build per-axis inside the loop.
 
     dlim = None if delta_lim is None else int(delta_lim)
 
@@ -311,7 +311,6 @@ def optical_pumping(
         cos_theta = 1.0 - 2.0*u          # uniform in [-1,1]
         theta_s = cp.arccos(cos_theta)
         phi_s   = 2*cp.pi*cp.random.random((N,), dtype=cp.float64)
-
 
         dK_sigma = delta_k(res.k_vec, angle_sigma, theta_s, phi_s)
         dK_pi    = delta_k(res.k_vec, angle_pi,    theta_s, phi_s)
@@ -334,7 +333,6 @@ def optical_pumping(
 
             # Optional: enforce |Δn| <= delta_lim
             if dlim is not None:
-                # |nf - n_i_raw| <= dlim  (broadcast nf over rows)
                 dn_ok = (cp.abs(nf_grid[None, :] - n_i_raw[:, None]) <= dlim)
                 prob = cp.where(dn_ok, prob, 0.0)
 
@@ -366,6 +364,7 @@ def optical_pumping(
         cycles_used = cp.where(active, cycles_used + 1, cycles_used)
 
     return cycles_used
+
 
 
 def rabi_transition_prob(omega: cp.ndarray, delta: cp.ndarray, t: cp.ndarray) -> cp.ndarray:
@@ -430,16 +429,13 @@ def excecute_single_raman_pulse(
     """
     Execute a single Raman pulse on-GPU (no sync).
 
-    Per-molecule site detuning DOES NOT change laser detuning.
-    It only modifies the site-dependent trap frequency spacing:
-
-        omega_eff_i = omega_trap + detuning_trap_axis + 2π * molecules_dev[:,6]   (rad/s)
-
-    Then:
-        freq = Delta_carrier + d_n_hint * omega_trap
-        m_closest_i = round(freq / omega_eff_i)
-        Delta_i(m) = Delta_carrier - m * omega_eff_i
+    molecules_dev now (N,8):
+      col 6: per-site trap detuning (Hz)  -> used to shift omega_eff
+      col 7: per-site carrier detuning (Hz) -> used to shift laser/carrier detuning
     """
+
+    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 8:
+        raise ValueError("molecules_dev must be (N,8)")
 
     d_n_hint = cp.asarray(d_n, dtype=cp.int32)
     N = int(molecules_dev.shape[0])
@@ -458,24 +454,30 @@ def excecute_single_raman_pulse(
     ld_idx = _ld_index_from_eta(eta_arr, res.LD_RES, res.ld_bins)
 
     # --- axis scalars ---
-    Delta_carrier = cp.asarray(detuning_ang[axis], dtype=cp.float64)       # rad/s (global)
-    detune_trap_axis = cp.asarray(detuning_trap[axis], dtype=cp.float64)   # rad/s (global)
-    trap_axis = cp.asarray(res.trap_freq[axis], dtype=cp.float64)          # rad/s (nominal)
+    Delta_carrier_global = cp.asarray(detuning_ang[axis], dtype=cp.float64)       # rad/s (global)
+    detune_trap_axis = cp.asarray(detuning_trap[axis], dtype=cp.float64)         # rad/s (global)
+    trap_axis = cp.asarray(res.trap_freq[axis], dtype=cp.float64)                # rad/s (nominal)
 
-    # --- per-molecule site-dependent trap frequency offset ---
-    # molecules_dev[:,6] is integer Hz -> rad/s
-    site_det_hz = molecules_dev[:, 6].astype(cp.float64)
-    site_det_ang = (2.0 * np.pi) * site_det_hz                             # (N,) rad/s
+    # --- per-molecule site-dependent trap frequency offset (col 6) ---
+    site_trap_det_hz = molecules_dev[:, 6].astype(cp.float64)                     # Hz
+    site_trap_det_ang = (2.0 * np.pi) * site_trap_det_hz                          # rad/s
+
+    # --- per-molecule carrier (laser) detuning shift (col 7) ---
+    site_carrier_det_hz = molecules_dev[:, 7].astype(cp.float64)                  # Hz
+    site_carrier_det_ang = (2.0 * np.pi) * site_carrier_det_hz                    # rad/s
 
     # per-molecule effective spacing
-    omega_eff = trap_axis + detune_trap_axis + site_det_ang                 # (N,) rad/s
+    omega_eff = trap_axis + detune_trap_axis + site_trap_det_ang                 # (N,) rad/s
     omega_eff_safe = cp.where(cp.abs(omega_eff) > 0, omega_eff, 1.0)
 
     # Compute scalar/array freq used for nearest order:
-    # freq = Δ_carrier + d_n_hint * ω_trap  (Δ_carrier global; ω_trap nominal)
-    freq = Delta_carrier + d_n_hint.astype(cp.float64) * trap_axis          # scalar or (N,)
+    # Δ_carrier_effective (per-mol) = global Δ_carrier + site_carrier_det
+    Delta_carrier_eff = Delta_carrier_global + site_carrier_det_ang              # (N,) rad/s
 
-    # nearest order per molecule
+    # freq = Δ_carrier_eff + d_n_hint * ω_trap  (note ω_trap nominal used to choose m)
+    freq = Delta_carrier_eff + d_n_hint.astype(cp.float64) * trap_axis          # (N,) rad/s or scalar+array broadcast
+
+    # nearest order per molecule (uses omega_eff per site)
     m_closest = cp.rint(freq / omega_eff_safe).astype(cp.int32)
     d_n_eff = m_closest
 
@@ -504,8 +506,8 @@ def excecute_single_raman_pulse(
 
         Omega = Omega_ang_base * mfac.astype(cp.float64)
 
-        # IMPORTANT: per-molecule detuning via omega_eff (site dependent)
-        # Delta_i(m) = freq - m * omega_eff_i
+        # Delta_i(m) = (Δ_carrier_global + site_carrier) - m * omega_eff
+        # Note: Delta_carrier_eff above already contains site_carrier (rad/s)
         Delta = freq - m_order.astype(cp.float64) * omega_eff      # (N,)
 
         P = rabi_transition_prob(Omega, Delta, t_arr)
@@ -557,13 +559,15 @@ def excecute_single_raman_pulse(
 
     molecules_dev[:, axis] = cp.maximum(molecules_dev[:, axis], 0)
 
+
 def blow_pulse(molecules_dev: cp.ndarray) -> None:
     """
     Mark molecules as lost if they are in mN = -1 (state col 3) OR spin = 1 (spin col 4).
-
-    molecules_dev layout: (N,7) int32 on GPU
-        [nx, ny, nz, mN(state), spin, is_lost, trap_det]
+    molecules_dev layout: (N,8) int32 on GPU
+        [nx, ny, nz, mN(state), spin, is_lost, trap_det, carrier_det]
     """
+    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 8:
+        raise ValueError("molecules_dev must be (N,8)")
     to_blow = (molecules_dev[:, 3] == -1) | (molecules_dev[:, 4] == 1)
     molecules_dev[to_blow, 5] = 1
 
@@ -660,6 +664,8 @@ def apply_lz_sweep(
 
     molecules_dev[:, axis] = cp.maximum(molecules_dev[:, axis], 0)
 
+from typing import Union  # make sure this import exists
+
 def raman_cool_with_pumping(
     molecules_dev: cp.ndarray,
     pulses_dev,
@@ -676,23 +682,22 @@ def raman_cool_with_pumping(
     """
     GPU Raman + optical pumping simulation (no GPU sync inside).
 
-    pulses: (P,4) expected:
-        pulses[p] = [axis, delta_n, Omega_lin, t_sec]
-          axis: int in {0,1,2}
-          delta_n: int (hint)
-          Omega_lin: Hz (linear)
-          t_sec: seconds
-
-    Rabi_scale:
-        - scalar (backwards compatible): same scale for all axes
-        - (3,) array-like: per-axis scale [sx, sy, sz]
+    molecules_dev must be (N,8) where col6=trap_det (Hz) and col7=carrier_det (Hz).
+    pulses:
+      - (P,4): [axis, delta_n, Omega_lin_Hz, t_sec]
+      - (P,5): [axis, delta_n, Omega_lin_Hz, t_sec, detuning_Hz]  (added to central_detuning for that pulse)
     """
-    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 7:
-        raise ValueError("molecules_dev must be (N,7)")
+    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 8:
+        raise ValueError("molecules_dev must be (N,8)")
 
-    pulses = np.asarray(pulses_dev, dtype=float)
-    if pulses.ndim != 2 or pulses.shape[1] not in (3, 4):
-        raise ValueError("pulses must be (P,3) or (P,4)")
+    # ---- make pulses host-side once (GPU-friendly overall) ----
+    if isinstance(pulses_dev, cp.ndarray):
+        pulses = cp.asnumpy(pulses_dev)  # one transfer, avoids per-pulse sync
+    else:
+        pulses = np.asarray(pulses_dev)
+
+    if pulses.ndim != 2 or pulses.shape[1] not in (4, 5):
+        raise ValueError("pulses must be (P,4) or (P,5)")
 
     N = int(molecules_dev.shape[0])
     if N == 0:
@@ -710,8 +715,8 @@ def raman_cool_with_pumping(
 
     LD_raman_vec = cp.asarray(LD_RAMAN, dtype=cp.float64)
 
-    # Per-axis detuning in angular frequency (rad/s)
-    detuning_ang = cp.asarray(
+    # Global detunings on device (angular rad/s)
+    detuning_ang_global = cp.asarray(
         2.0 * np.pi * np.asarray(central_detuning, dtype=float),
         dtype=cp.float64,
     )
@@ -720,18 +725,30 @@ def raman_cool_with_pumping(
         dtype=cp.float64,
     )
 
-    pulse_iter = tqdm(range(pulses.shape[0]), desc="Raman pulses", disable=not show_progress)
-    n_cols = pulses.shape[1]
+    P = int(pulses.shape[0])
+    n_cols = int(pulses.shape[1])
+
+    pulse_iter = tqdm(range(P), desc="Raman pulses", disable=not show_progress)
 
     for p in pulse_iter:
         axis = int(pulses[p, 0])
-        d_n = int(pulses[p, 1])
+        d_n  = int(pulses[p, 1])
 
-        if n_cols == 3:
-            raise ValueError("pulses (P,3) not supported in this path; please provide (P,4)")
+        Omega_lin = float(pulses[p, 2])  # Hz
+        t_sec     = float(pulses[p, 3])  # s
+
+        # optional per-pulse laser detuning in linear Hz (added to global central_detuning)
+        if n_cols == 5:
+            det_pulse_hz = float(pulses[p, 4])
         else:
-            Omega_lin = float(pulses[p, 2])  # Hz
-            t_sec = float(pulses[p, 3])      # s
+            det_pulse_hz = 0.0
+
+        # Build per-pulse detuning vector on device (tiny (3,) copy)
+        if det_pulse_hz != 0.0:
+            detuning_ang_pulse = detuning_ang_global.copy()
+            detuning_ang_pulse[axis] = detuning_ang_pulse[axis] + (2.0 * np.pi) * det_pulse_hz
+        else:
+            detuning_ang_pulse = detuning_ang_global  # reuse, no alloc
 
         excecute_single_raman_pulse(
             molecules_dev,
@@ -741,7 +758,7 @@ def raman_cool_with_pumping(
             t_sec=t_sec,
             res=res,
             LD_raman_vec=LD_raman_vec,
-            detuning_ang=detuning_ang,
+            detuning_ang=detuning_ang_pulse,      # <-- includes per-pulse detuning; per-site carrier det will be added inside
             detuning_trap=detuning_trap_ang,
             Rabi_scale=Rabi_scale_dev,
             k_max=k_max,
@@ -753,6 +770,7 @@ def raman_cool_with_pumping(
             K_max=K_max,
             delta_lim=delta_lim,
         )
+
 
 
 def raman_sideband_thermometry(
@@ -769,19 +787,11 @@ def raman_sideband_thermometry(
     """
     Simulate Raman sideband thermometry without GPU synchronization.
 
-    Parameters:
-        molecules_dev: (N,7) array of molecules on device
-        axis: 0, 1, or 2 for the trap axis to probe
-        frequencys: (F,) array of Raman probe frequencies (linear Hz) on device
-        rabi_freq: Rabi frequency (linear Hz) of the Raman probe
-        pulse_time: pulse duration (seconds)
-        res: GPUResources container
-        trap_detuning: per-axis trap frequency detuning in linear Hz (host sequence)
-        show_progress: whether to show a progress bar
-        k_max: maximum off-resonant sideband order to include
+    molecules_dev must be (N,8). Per-site carrier detuning (col 7) will be accounted for
+    inside excecute_single_raman_pulse (it is added to the passed detuning_ang).
     """
-    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 7:
-        raise ValueError("molecules_dev must be (N,6)")
+    if molecules_dev.ndim != 2 or molecules_dev.shape[1] != 8:
+        raise ValueError("molecules_dev must be (N,8)")
     if axis not in (0, 1, 2):
         raise ValueError("axis must be 0, 1, or 2")
     if frequencys.ndim != 1:
@@ -823,6 +833,8 @@ def raman_sideband_thermometry(
         d_n = cp.rint(freq / (trap_hz + trap_detuning[axis])).astype(cp.int32)
 
         # Residual detuning to nearest transition (linear Hz -> angular rad/s), on device
+        # This is the global residual detuning — per-site carrier detunings (col 7) will be added
+        # inside excecute_single_raman_pulse via molecules_dev[:,7].
         detuning_ang = cp.zeros((3,), dtype=cp.float64)
         detuning_ang[axis] = (2.0 * np.pi) * (freq - d_n.astype(cp.float64) * trap_hz)
 
@@ -852,20 +864,3 @@ def raman_sideband_thermometry(
         )
 
     return frequencys, polarizations
-
-
-# -------------------------
-# Convenience
-# -------------------------
-
-def count_survivors(molecules_dev: cp.ndarray) -> int:
-    ok = (molecules_dev[:, 5] == 0) & (molecules_dev[:, 4] == 0) & (molecules_dev[:, 3] == 1)
-    return int(ok.sum().get())
-
-def ground_state_rate(molecules_dev: cp.ndarray) -> float:
-    ok = (molecules_dev[:, 5] == 0) & (molecules_dev[:, 4] == 0) & (molecules_dev[:, 3] == 1)
-    gnd = ok & (molecules_dev[:, 0] == 0) & (molecules_dev[:, 1] == 0) & (molecules_dev[:, 2] == 0)
-    denom = int(ok.sum().get())
-    if denom == 0:
-        return 0.0
-    return float(gnd.sum().get() / denom)
