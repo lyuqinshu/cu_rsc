@@ -54,12 +54,12 @@ mols = cr.build_thermal_molecules(n, temp)
 You can also add a trap frequency deviation to the sample to simulate an inhomogeneous tweezer array.
 
 ### Generate RSC pulses
-All raman pulse sequence should be in the form of (N, 4) numpy array
-N is the number of the pulse, each pulse in the convension of (axis, Δn, Ω, t)
-For example, a sequence of a single pulse cooling in Z axis with Δn=-1, Rabi frequency of 2π*3kHz and a pulse duration of 20μs should be
+All raman pulse sequence should be in the form of (N, 5) numpy array
+N is the number of the pulse, each pulse in the convension of (axis, Δn, Ω, t, Δ)
+For example, a sequence of a single pulse cooling in Z axis with Δn=-1, Rabi frequency of 2π*3kHz, a pulse duration of 20μs and detuning of -2π*2kHz should be
 
 ```python
-sequence = np.array([[2, -1, 3e3, 20e-6]])
+sequence = np.array([[2, -1, 3e3, 20e-6, -2e3]])
 ```
 
 ### Apply pulses
@@ -72,6 +72,20 @@ cr.raman_cool_with_pumping(
   res)
 ```
 Detuning, off-resonance drive and more options are available.
+
+You can also use a LZ sweep to remove the residual higher quanta
+
+```python
+cr.apply_lz_sweep(
+  mols,
+  axis=2,
+  d_n=-2,
+  Omega_lin=3e3,
+  Delta_sweep=2e3,
+  t_sec=4e-3,
+  res=res)
+cr.blow_pulse(mols)
+```
 
 ---
 
